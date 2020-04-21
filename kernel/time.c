@@ -9,6 +9,7 @@
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/resource.h"
+#include "kernel/time.h"
 #include "fs/poll.h"
 
 dword_t sys_time(addr_t time_out) {
@@ -17,6 +18,10 @@ dword_t sys_time(addr_t time_out) {
         if (user_put(time_out, now))
             return _EFAULT;
     return now;
+}
+
+dword_t sys_stime(addr_t UNUSED(time)) {
+    return _EPERM;
 }
 
 dword_t sys_clock_gettime(dword_t clock, addr_t tp) {
@@ -44,6 +49,7 @@ dword_t sys_clock_gettime(dword_t clock, addr_t tp) {
     t.nsec = ts.tv_nsec;
     if (user_put(tp, t))
         return _EFAULT;
+    STRACE(" {%lds %ldns}", t.sec, t.nsec);
     return 0;
 }
 
@@ -73,38 +79,45 @@ dword_t sys_clock_settime(dword_t UNUSED(clock), addr_t UNUSED(tp)) {
 }
 
 static void itimer_notify(struct task *task) {
-    send_signal(task, SIGALRM_);
+    struct siginfo_ info = {
+        .code = SI_TIMER_,
+    };
+    send_signal(task, SIGALRM_, info);
 }
 
-dword_t sys_setitimer(dword_t which, addr_t new_val_addr, addr_t old_val_addr) {
+static int itimer_set(struct tgroup *group, int which, struct timer_spec spec, struct timer_spec *old_spec) {
     if (which != ITIMER_REAL_) {
         FIXME("unimplemented setitimer %d", which);
         return _EINVAL;
     }
 
-    struct itimerval_ val;
-    if (user_get(new_val_addr, val))
-        return _EFAULT;
-
-    STRACE("setitimer({%ds %dus, %ds %dus}, 0x%x)", val.value.sec, val.value.usec, val.interval.sec, val.interval.usec, old_val_addr);
-    struct tgroup *group = current->group;
-    lock(&group->lock);
     if (!group->timer) {
-        struct timer *timer = timer_new((timer_callback_t) itimer_notify, current);
-        if (IS_ERR(timer)) {
-            unlock(&group->lock);
+        struct timer *timer = timer_new(CLOCK_REALTIME, (timer_callback_t) itimer_notify, current);
+        if (IS_ERR(timer))
             return PTR_ERR(timer);
-        }
         group->timer = timer;
     }
 
-    struct timer_spec spec;
-    spec.interval.tv_sec = val.interval.sec;
-    spec.interval.tv_nsec = val.interval.usec * 1000;
-    spec.value.tv_sec = val.value.sec;
-    spec.value.tv_nsec = val.value.usec * 1000;
+    return timer_set(group->timer, spec, old_spec);
+}
+
+int_t sys_setitimer(int_t which, addr_t new_val_addr, addr_t old_val_addr) {
+    struct itimerval_ val;
+    if (user_get(new_val_addr, val))
+        return _EFAULT;
+    STRACE("setitimer(%d, {%ds %dus, %ds %dus}, 0x%x)", which, val.value.sec, val.value.usec, val.interval.sec, val.interval.usec, old_val_addr);
+
+    struct timer_spec spec = {
+        .interval.tv_sec = val.interval.sec,
+        .interval.tv_nsec = val.interval.usec * 1000,
+        .value.tv_sec = val.value.sec,
+        .value.tv_nsec = val.value.usec * 1000,
+    };
     struct timer_spec old_spec;
-    int err = timer_set(group->timer, spec, &old_spec);
+
+    struct tgroup *group = current->group;
+    lock(&group->lock);
+    int err = itimer_set(group, which, spec, &old_spec);
     unlock(&group->lock);
     if (err < 0)
         return err;
@@ -120,6 +133,29 @@ dword_t sys_setitimer(dword_t which, addr_t new_val_addr, addr_t old_val_addr) {
     }
 
     return 0;
+}
+
+uint_t sys_alarm(uint_t seconds) {
+    STRACE("alarm(%d)", seconds);
+    struct timer_spec spec = {
+        .value.tv_sec = seconds,
+    };
+    struct timer_spec old_spec;
+
+    struct tgroup *group = current->group;
+    lock(&group->lock);
+    int err = itimer_set(group, ITIMER_REAL_, spec, &old_spec);
+    unlock(&group->lock);
+    if (err < 0)
+        return err;
+
+    // Round up, and make sure to not return 0 if old_spec is > 0
+    seconds = old_spec.value.tv_sec;
+    if (old_spec.value.tv_nsec >= 500000000)
+        seconds++;
+    if (seconds == 0 && !timespec_is_zero(old_spec.value))
+        seconds = 1;
+    return seconds;
 }
 
 dword_t sys_nanosleep(addr_t req_addr, addr_t rem_addr) {
@@ -148,8 +184,8 @@ dword_t sys_times(addr_t tbuf) {
     if (tbuf) {
         struct tms_ tmp;
         struct rusage_ rusage = rusage_get_current();
-        tmp.tms_utime = (rusage.utime.sec * 100) + (rusage.utime.usec/10000);
-        tmp.tms_stime = (rusage.utime.sec * 100) + (rusage.utime.usec/10000);
+        tmp.tms_utime = clock_from_timeval(rusage.utime);
+        tmp.tms_stime = clock_from_timeval(rusage.stime);
         tmp.tms_cutime = tmp.tms_utime;
         tmp.tms_cstime = tmp.tms_stime;
         if (user_put(tbuf, tmp))
@@ -185,7 +221,7 @@ static struct fd_ops timerfd_ops;
 
 static void timerfd_callback(struct fd *fd) {
     lock(&fd->lock);
-    fd->expirations++;
+    fd->timerfd.expirations++;
     notify(&fd->cond);
     unlock(&fd->lock);
     poll_wakeup(fd);
@@ -193,46 +229,99 @@ static void timerfd_callback(struct fd *fd) {
 
 fd_t sys_timerfd_create(int_t clockid, int_t flags) {
     STRACE("timerfd_create(%d, %#x)", clockid, flags);
-    if (clockid != ITIMER_REAL_) {
-        FIXME("timerfd %d", clockid);
-        return _EINVAL;
+    clockid_t real_clockid;
+    switch (clockid) {
+        case CLOCK_REALTIME_: real_clockid = CLOCK_REALTIME; break;
+        case CLOCK_MONOTONIC_: real_clockid = CLOCK_MONOTONIC; break;
+        default: FIXME("timerfd %d", clockid); return _EINVAL;
     }
 
     struct fd *fd = adhoc_fd_create(&timerfd_ops);
     if (fd == NULL)
         return _ENOMEM;
 
-    fd->timer = timer_new((timer_callback_t) timerfd_callback, fd);
+    fd->timerfd.timer = timer_new(real_clockid, (timer_callback_t) timerfd_callback, fd);
     return f_install(fd, flags);
+}
+
+#define TFD_TIMER_ABSTIME_ (1 << 0)
+
+int_t sys_timerfd_settime(fd_t f, int_t flags, addr_t new_value_addr, addr_t old_value_addr) {
+    STRACE("timerfd_settime(%d, %d, %#x, %#x)", f, flags, new_value_addr, old_value_addr);
+    if (flags & ~(TFD_TIMER_ABSTIME_))
+        return _EINVAL;
+    struct fd *fd = f_get(f);
+    if (fd == NULL)
+        return _EBADF;
+    if (fd->ops != &timerfd_ops)
+        return _EINVAL;
+    struct itimerspec_ value;
+    if (user_get(new_value_addr, value))
+        return _EFAULT;
+
+    struct timer_spec spec = {
+        .value.tv_sec = value.value.sec,
+        .value.tv_nsec = value.value.nsec,
+        .interval.tv_sec = value.interval.sec,
+        .interval.tv_nsec = value.interval.nsec,
+    };
+    struct timer_spec old_spec;
+    if (flags & TFD_TIMER_ABSTIME_) {
+        struct timespec now = timespec_now(fd->timerfd.timer->clockid);
+        spec.value = timespec_subtract(spec.value, now);
+    }
+
+    lock(&fd->lock);
+    int err = timer_set(fd->timerfd.timer, spec, &old_spec);
+    unlock(&fd->lock);
+    if (err < 0)
+        return err;
+
+    if (old_value_addr) {
+        struct itimerspec_ old_value = {
+            .value.sec = old_spec.value.tv_sec,
+            .value.nsec = old_spec.value.tv_nsec,
+            .interval.sec = old_spec.interval.tv_sec,
+            .interval.nsec = old_spec.interval.tv_nsec,
+        };
+        if (user_put(old_value_addr, old_value))
+            return _EFAULT;
+    }
+
+    return 0;
 }
 
 static ssize_t timerfd_read(struct fd *fd, void *buf, size_t bufsize) {
     if (bufsize < sizeof(uint64_t))
         return _EINVAL;
     lock(&fd->lock);
-    while (fd->expirations == 0) {
+    while (fd->timerfd.expirations == 0) {
         if (fd->flags & O_NONBLOCK_) {
             unlock(&fd->lock);
             return _EAGAIN;
         }
-        wait_for(&fd->cond, &fd->lock, NULL);
+        int err = wait_for(&fd->cond, &fd->lock, NULL);
+        if (err < 0) {
+            unlock(&fd->lock);
+            return err;
+        }
     }
 
-    *(uint64_t *) buf = fd->expirations;
-    fd->expirations = 0;
+    *(uint64_t *) buf = fd->timerfd.expirations;
+    fd->timerfd.expirations = 0;
     unlock(&fd->lock);
     return sizeof(uint64_t);
 }
 static int timerfd_poll(struct fd *fd) {
     int res = 0;
     lock(&fd->lock);
-    if (fd->expirations == 0)
+    if (fd->timerfd.expirations != 0)
         res |= POLL_READ;
     unlock(&fd->lock);
     return res;
 }
 static int timerfd_close(struct fd *fd) {
-    timer_free(fd->timer);
+    timer_free(fd->timerfd.timer);
     return 0;
 }
 

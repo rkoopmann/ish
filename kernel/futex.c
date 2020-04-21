@@ -56,7 +56,9 @@ static void futex_put(struct futex *futex) {
 
 static int futex_load(struct futex *futex, dword_t *out) {
     assert(futex->mem == current->mem);
+    read_wrlock(&current->mem->lock);
     dword_t *ptr = mem_ptr(current->mem, futex->addr, MEM_READ);
+    read_wrunlock(&current->mem->lock);
     if (ptr == NULL)
         return 1;
     *out = *ptr;
@@ -74,6 +76,7 @@ int futex_wait(addr_t uaddr, dword_t val, struct timespec *timeout) {
     else
         err = wait_for(&futex->cond, &futex_lock, timeout);
     futex_put(futex);
+    STRACE("%d end futex(FUTEX_WAIT)", current->pid);
     return err;
 }
 
@@ -96,10 +99,10 @@ int futex_wake(addr_t uaddr, dword_t val) {
 
 dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2, addr_t uaddr2, dword_t val3) {
     if (!(op & FUTEX_PRIVATE_FLAG_)) {
-        FIXME("no support for shared futexes");
+        STRACE("!FUTEX_PRIVATE ");
     }
     struct timespec timeout = {0};
-    if ((op & (FUTEX_WAIT_)) > 0) {
+    if ((op & FUTEX_CMD_MASK_) == FUTEX_WAIT_ && timeout_or_val2) {
         struct timespec_ timeout_;
         if (user_get(timeout_or_val2, timeout_))
             return _EFAULT;
@@ -108,7 +111,7 @@ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2,
     }
     switch (op & FUTEX_CMD_MASK_) {
         case FUTEX_WAIT_:
-            STRACE("futex(FUTEX_WAIT, %#x, %d, 0x%x {%ds %dns})", uaddr, val, timeout_or_val2, timeout.tv_sec, timeout.tv_nsec);
+            STRACE("futex(FUTEX_WAIT, %#x, %d, 0x%x {%ds %dns}) = ...\n", uaddr, val, timeout_or_val2, timeout.tv_sec, timeout.tv_nsec);
             return futex_wait(uaddr, val, timeout_or_val2 ? &timeout : NULL);
         case FUTEX_WAKE_:
             STRACE("futex(FUTEX_WAKE, %#x, %d)", uaddr, val);
@@ -117,4 +120,34 @@ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2,
     STRACE("futex(%#x, %d, %d, timeout=%#x, %#x, %d) ", uaddr, op, val, timeout_or_val2, uaddr2, val3);
     FIXME("unsupported futex operation %d", op);
     return _ENOSYS;
+}
+
+struct robust_list_head_ {
+    addr_t list;
+    dword_t offset;
+    addr_t list_op_pending;
+};
+
+int_t sys_set_robust_list(addr_t robust_list, dword_t len) {
+    STRACE("set_robust_list(%#x, %d)", robust_list, len);
+    if (len != sizeof(struct robust_list_head_))
+        return _EINVAL;
+    current->robust_list = robust_list;
+    return 0;
+}
+
+int_t sys_get_robust_list(pid_t_ pid, addr_t robust_list_ptr, addr_t len_ptr) {
+    STRACE("get_robust_list(%d, %#x, %#x)", pid, robust_list_ptr, len_ptr);
+
+    lock(&pids_lock);
+    struct task *task = pid_get_task(pid);
+    unlock(&pids_lock);
+    if (task != current)
+        return _EPERM;
+
+    if (user_put(robust_list_ptr, current->robust_list))
+        return _EFAULT;
+    if (user_put(len_ptr, (int[]) {sizeof(struct robust_list_head_)}))
+        return _EFAULT;
+    return 0;
 }

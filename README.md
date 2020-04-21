@@ -1,8 +1,8 @@
 # [iSH](https://ish.app)
 
-[![Build Status](https://travis-ci.org/tbodt/ish.svg?branch=master)](https://travis-ci.org/tbodt/ish)
-[![goto counter](https://img.shields.io/github/search/tbodt/ish/goto.svg)](https://github.com/tbodt/ish/search?q=goto)
-[![fuck counter](https://img.shields.io/github/search/tbodt/ish/fuck.svg)](https://github.com/tbodt/ish/search?q=fuck)
+[![Build Status](https://travis-ci.org/ish-app/ish.svg?branch=master)](https://travis-ci.org/ish-app/ish)
+[![goto counter](https://img.shields.io/github/search/ish-app/ish/goto.svg)](https://github.com/ish-app/ish/search?q=goto)
+[![fuck counter](https://img.shields.io/github/search/ish-app/ish/fuck.svg)](https://github.com/ish-app/ish/search?q=fuck)
 
 <p align="center">
 <a href="https://ish.app">
@@ -14,42 +14,48 @@ A project to get a Linux shell running on iOS, using usermode x86 emulation and 
 
 For the current status of the project, check the issues tab, and the commit logs.
 
-You can [join the Testflight beta](https://testflight.apple.com/join/97i7KM8O) now. There's also a [Discord server](https://discord.gg/SndDh5y).
+- [Testflight beta](https://testflight.apple.com/join/97i7KM8O)
+- [Discord server](https://discord.gg/SndDh5y)
+- [Wiki with help and tutorials](https://github.com/ish-app/ish/wiki)
+- [README in Chinese](https://github.com/ish-app/ish/blob/master/README_ZH.md) (may be out of date, if so send PRs)
 
 # Hacking
+
+This project has a git submodule, make sure to clone with `--recurse-submodules` or run `git submodule update --init` after cloning.
 
 You'll need these things to build the project:
 
  - Python 3
  - Ninja
- - Yarn (only when building for iOS)
  - Meson (`pip install meson`)
  - Clang and LLD (on mac, `brew install llvm`, on linux, `sudo apt install clang lld` or `sudo pacman -S clang lld` or whatever)
+ - sqlite3 (this is so common it may already be installed on linux and is definitely already installed on mac. if not, do something like `sudo apt install libsqlite3-dev`)
+
+## Build for iOS
+
+Open the project in Xcode, open iSH.xcconfig, and change `ROOT_BUNDLE_IDENTIFIER` to something unique. Then click Run. There are scripts that should do everything else automatically. If you run into any problems, open an issue and I'll try to help.
+
+## Build command line tool for testing
 
 To set up your environment, cd to the project and run `meson build` to create a build directory in `build`. Then cd to the build directory and run `ninja`.
 
-To set up a self-contained Alpine linux filesystem, download the Alpine minirootfs tarball for i386 from the [Alpine website](https://alpinelinux.org/downloads/) and run the `tools/fakefsify.py` script. Specify the minirootfs tarball as the first argument and the name of the output directory as the second argument. Then you can run things inside the Alpine filesystem with `./ish -f alpine /bin/login`, assuming the output directory is called `alpine`.
+To set up a self-contained Alpine linux filesystem, download the Alpine minirootfs tarball for i386 from the [Alpine website](https://alpinelinux.org/downloads/) and run the `tools/fakefsify.py` script. Specify the minirootfs tarball as the first argument and the name of the output directory as the second argument. Then you can run things inside the Alpine filesystem with `./ish -f alpine /bin/login -f root`, assuming the output directory is called `alpine`.
 
 You can replace `ish` with `tools/ptraceomatic` to run the program in a real process and single step and compare the registers at each step. I use it for debugging. Requires 64-bit Linux 4.11 or later.
 
-To compile the iOS app, just open the Xcode project and click run. There are scripts that should download and set up the alpine filesystem and create build directories for cross compilation and so on automatically.
+## Logging
 
-## Further setup guide
+iSH has several logging channels which can be enabled at build time. By default, all of them are disabled. To enable them:
 
-To enable local development there are a few more steps that needs to be done.
+- In Xcode: Set the `ISH_LOG` setting in iSH.xcconfig to a space-separated list of log channels.
+- With Meson (command line tool for testing): Run `meson configure -Dlog="<space-separated list of log channels>`.
 
-- Go to the project settings in Xcode find the "iSH" target
-- Under "General" change the bundle identifier to a specific identifier for you
-- Under "Capabilities" change the name of the "App Group" and remove the old app group
+Available channels:
 
-- Go to the "iSHFileProvider" target
-- Under "General" use the same bundle identifier you created before and add `.FileProvider` to it
-- Under "Capabilities" use the same name of the "App Group" as for the "iSH" target
-
-- Go to the file `app/AppDelegate.m`
-- Change the string in the function `manager containerURLForSecurityApplicationGroupIdentifier:` to your App Group name that you entered in the step before.
-
-Congratulations! You should now have the app running!
+- `strace`: The most useful channel, logs the parameters and return value of almost every system call.
+- `instr`: Logs every instruction executed by the emulator. This slows things down a lot.
+- `verbose`: Debug logs that don't fit into another category.
+- Grep for `DEFAULT_CHANNEL` to see if more log channels have been added since this list was updated.
 
 # A note on the JIT
 

@@ -43,7 +43,7 @@ struct task *task_create_(struct task *parent) {
     static int cur_pid = 0;
     do {
         cur_pid++;
-        if (cur_pid > MAX_PID) cur_pid = 0;
+        if (cur_pid > MAX_PID) cur_pid = 1;
     } while (!pid_empty(&pids[cur_pid]));
     struct pid *pid = &pids[cur_pid];
     pid->id = cur_pid;
@@ -58,15 +58,21 @@ struct task *task_create_(struct task *parent) {
         *task = *parent;
     task->pid = pid->id;
     pid->task = task;
-    unlock(&pids_lock);
 
-    task->did_exec = false;
     list_init(&task->children);
     list_init(&task->siblings);
     if (parent != NULL) {
         task->parent = parent;
         list_add(&parent->children, &task->siblings);
     }
+    unlock(&pids_lock);
+
+    task->pending = 0;
+    list_init(&task->queue);
+    task->clear_tid = 0;
+    task->robust_list = 0;
+    task->did_exec = false;
+    lock_init(&task->general_lock);
 
     task->sockrestart = (struct task_sockrestart) {};
     list_init(&task->sockrestart.listen);
@@ -107,6 +113,7 @@ void task_start(struct task *task) {
 }
 
 int_t sys_sched_yield() {
+    STRACE("sched_yield()");
     sched_yield();
     return 0;
 }

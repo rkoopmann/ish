@@ -1,3 +1,4 @@
+#include <string.h>
 #include "debug.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
@@ -22,11 +23,14 @@ struct mm *mm_copy(struct mm *mm) {
     if (new_mm == NULL)
         return NULL;
     *new_mm = *mm;
+    // Fix wrlock_init failing because it thinks it's reinitializing the same lock
+    memset(&new_mm->mem.lock, 0, sizeof(new_mm->mem.lock));
+    new_mm->refcount = 1;
     mem_init(&new_mm->mem);
     fd_retain(new_mm->exefile);
-    read_wrlock(&mm->mem.lock);
-    pt_copy_on_write(&mm->mem, 0, &new_mm->mem, 0, MEM_PAGES);
-    read_wrunlock(&mm->mem.lock);
+    write_wrlock(&mm->mem.lock);
+    pt_copy_on_write(&mm->mem, &new_mm->mem, 0, MEM_PAGES);
+    write_wrunlock(&mm->mem.lock);
     return new_mm;
 }
 
@@ -47,20 +51,24 @@ static addr_t do_mmap(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_
     int err;
     pages_t pages = PAGE_ROUND_UP(len);
     page_t page;
+    if (addr != 0) {
+        if (PGOFFSET(addr) != 0)
+            return _EINVAL;
+        page = PAGE(addr);
+        if (!(flags & MMAP_FIXED) && !pt_is_hole(current->mem, page, pages)) {
+            addr = 0;
+        }
+    }
     if (addr == 0) {
         page = pt_find_hole(current->mem, pages);
         if (page == BAD_PAGE)
             return _ENOMEM;
-    } else {
-        if (PGOFFSET(addr) != 0)
-            return _EINVAL;
-        page = PAGE(addr);
     }
+
+    if (flags & MMAP_SHARED)
+        prot |= P_SHARED;
+
     if (flags & MMAP_ANONYMOUS) {
-        if (!(flags & MMAP_PRIVATE)) {
-            TODO("MMAP_SHARED");
-            return _EINVAL;
-        }
         if ((err = pt_map_nothing(current->mem, page, pages, prot)) < 0)
             return err;
     } else {
@@ -72,6 +80,8 @@ static addr_t do_mmap(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_
             return _ENODEV;
         if ((err = fd->ops->mmap(fd, current->mem, page, pages, offset, prot, flags)) < 0)
             return err;
+        mem_pt(current->mem, page)->data->fd = fd_retain(fd);
+        mem_pt(current->mem, page)->data->file_offset = offset;
     }
     return page << PAGE_BITS;
 }
@@ -80,7 +90,9 @@ static addr_t mmap_common(addr_t addr, dword_t len, dword_t prot, dword_t flags,
     STRACE("mmap(0x%x, 0x%x, 0x%x, 0x%x, %d, %d)", addr, len, prot, flags, fd_no, offset);
     if (len == 0)
         return _EINVAL;
-    if (prot & ~(P_READ | P_WRITE | P_EXEC))
+    if (prot & ~P_RWX)
+        return _EINVAL;
+    if ((flags & MMAP_PRIVATE) && (flags & MMAP_SHARED))
         return _EINVAL;
 
     write_wrlock(&current->mem->lock);
@@ -93,8 +105,15 @@ addr_t sys_mmap2(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_t fd_
     return mmap_common(addr, len, prot, flags, fd_no, offset << PAGE_BITS);
 }
 
-addr_t sys_mmap(struct mmap_arg_struct *args) {
-    return mmap_common(args->addr, args->len, args->prot, args->flags, args->fd, args->offset);
+struct mmap_arg_struct {
+    dword_t addr, len, prot, flags, fd, offset;
+};
+
+addr_t sys_mmap(addr_t args_addr) {
+    struct mmap_arg_struct args;
+    if (user_get(args_addr, args))
+        return _EFAULT;
+    return mmap_common(args.addr, args.len, args.prot, args.flags, args.fd, args.offset);
 }
 
 int_t sys_munmap(addr_t addr, uint_t len) {
@@ -104,7 +123,7 @@ int_t sys_munmap(addr_t addr, uint_t len) {
     if (len == 0)
         return _EINVAL;
     write_wrlock(&current->mem->lock);
-    int err = pt_unmap(current->mem, PAGE(addr), PAGE_ROUND_UP(len), 0);
+    int err = pt_unmap_always(current->mem, PAGE(addr), PAGE_ROUND_UP(len));
     write_wrunlock(&current->mem->lock);
     if (err < 0)
         return _EINVAL;
@@ -129,7 +148,7 @@ int_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags) {
 
     // shrinking always works
     if (new_pages <= old_pages) {
-        int err = pt_unmap(current->mem, PAGE(addr) + new_pages, old_pages - new_pages, 0);
+        int err = pt_unmap(current->mem, PAGE(addr) + new_pages, old_pages - new_pages);
         if (err < 0)
             return _EFAULT;
         return addr;
@@ -144,7 +163,7 @@ int_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags) {
         if (entry == NULL && entry->flags != pt_flags)
             return _EFAULT;
     }
-    if (!(pt_flags & P_ANON)) {
+    if (!(pt_flags & P_ANONYMOUS)) {
         FIXME("mremap grow on file mappings");
         return _EFAULT;
     }
@@ -162,7 +181,7 @@ int_t sys_mprotect(addr_t addr, uint_t len, int_t prot) {
     STRACE("mprotect(0x%x, 0x%x, 0x%x)", addr, len, prot);
     if (PGOFFSET(addr) != 0)
         return _EINVAL;
-    if (prot & ~(P_READ | P_WRITE | P_EXEC))
+    if (prot & ~P_RWX)
         return _EINVAL;
     pages_t pages = PAGE_ROUND_UP(len);
     write_wrlock(&current->mem->lock);
@@ -182,6 +201,10 @@ dword_t sys_mbind(addr_t UNUSED(addr), dword_t UNUSED(len), int_t UNUSED(mode),
 }
 
 int_t sys_mlock(addr_t UNUSED(addr), dword_t UNUSED(len)) {
+    return 0;
+}
+
+int_t sys_msync(addr_t UNUSED(addr), dword_t UNUSED(len), int_t UNUSED(flags)) {
     return 0;
 }
 
@@ -211,7 +234,7 @@ addr_t sys_brk(addr_t new_brk) {
         // shrink heap: unmap region from new_brk to old_brk
         // first page to unmap is PAGE(new_brk)
         // last page to unmap is PAGE(old_brk)
-        pt_unmap(&mm->mem, PAGE(new_brk), PAGE(old_brk), PT_FORCE);
+        pt_unmap_always(&mm->mem, PAGE(new_brk), PAGE(old_brk) - PAGE(new_brk));
     }
 
     mm->brk = new_brk;

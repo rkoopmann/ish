@@ -49,25 +49,53 @@
     movb %r15b, CPU_eflags(%_cpu)
 .endm
 
-.gadget cmpxchg32_mem
-    write_prep 32, cmpxchg32_mem
-    cmpxchg %tmpd, (%_addrq)
-    pushf
-    write_done 32, cmpxchg32_mem
-    popf
-    cmpxchg_set_flags
-    gret 1
-.gadget_array cmpxchg
+.macro do_cmpxchg size, s, ss
+    .gadget cmpxchg\size\()_mem
+        write_prep \size, cmpxchg\size\()_mem
+        cmpxchg\ss %tmp\s, (%_addrq)
+        pushf
+        write_done \size, cmpxchg\size\()_mem
+        popf
+        cmpxchg_set_flags
+        gret 1
 
-.gadget atomic_cmpxchg32_mem
-    write_prep 32, atomic_cmpxchg32_mem
-    lock cmpxchg %tmpd, (%_addrq)
-    pushf
-    write_done 32, atomic_cmpxchg32_mem
-    popf
-    cmpxchg_set_flags
-    gret 1
+    .gadget atomic_cmpxchg\size\()_mem
+        write_prep \size, atomic_cmpxchg\size\()_mem
+        lock cmpxchg\ss %tmp\s, (%_addrq)
+        pushf
+        write_done \size, atomic_cmpxchg\size\()_mem
+        popf
+        cmpxchg_set_flags
+        gret 1
+.endm
+
+.irp size, SIZE_LIST
+    ss \size, do_cmpxchg
+.endr
+.gadget_array cmpxchg
 .gadget_array atomic_cmpxchg
+
+.gadget atomic_cmpxchg8b
+    write_prep 64, atomic_cmpxchg8b
+    lock cmpxchg8b (%_addrq)
+    setz %r15b
+    write_done 64, atomic_cmpxchg8b
+    andl $~ZF_RES, CPU_flags_res(%_cpu)
+    andl $~ZF_FLAG, CPU_eflags(%_cpu)
+    shlb $6, %r15b
+    orb %r15b, CPU_eflags(%_cpu)
+    gret 1
+
+.gadget cmpxchg8b
+    write_prep 64, cmpxchg8b
+    cmpxchg8b (%_addrq)
+    setz %r15b
+    write_done 64, cmpxchg8b
+    andl $~ZF_RES, CPU_flags_res(%_cpu)
+    andl $~ZF_FLAG, CPU_eflags(%_cpu)
+    shlb $6, %r15b
+    orb %r15b, CPU_eflags(%_cpu)
+    gret 1
 
 .macro do_helper type, size=
     .gadget helper_\type\size
@@ -107,6 +135,71 @@ do_helper 2
 .irp size, SIZE_LIST,64,80
     do_helper read, \size
     do_helper write, \size
+.endr
+
+# sync with enum vec_arg
+#define VEC_ARG_LIST xmm,reg,imm
+
+.macro do_vec_helper name, reg, rm, size=
+    # general register access is unimplemented
+    .ifc \reg,reg; .exitm; .endif
+    .ifc \rm,reg; .exitm; .endif
+
+    .gadget vec_helper_\name
+        .ifin(\rm, read,write)
+            \rm\()_prep (\size), vec_helper_\name
+        .endifin
+        save_regs
+        save_c
+        movq %_cpu, %rdi
+        xorq %r14, %r14
+        .ifin(\rm, xmm)
+            movb 8(%_ip), %r14b
+            leaq CPU_xmm(%_cpu,%r14), %rdx
+            movb 9(%_ip), %r14b
+            leaq CPU_xmm(%_cpu,%r14), %rsi
+            callq *(%_ip)
+        .endifin
+        .ifin(\rm, read,write)
+            movb 16(%_ip), %r14b
+            leaq CPU_xmm(%_cpu,%r14), %rdx
+            movq %_addrq, %rsi
+            callq *8(%_ip)
+        .endifin
+        .ifin(\rm, imm)
+            movb 8(%_ip), %r14b
+            leaq CPU_xmm(%_cpu,%r14), %rdx
+            movb 9(%_ip), %sil
+            callq *(%_ip)
+        .endifin
+        restore_c
+        load_regs
+        .ifc \rm,write
+            write_done (\size), vec_helper_\name
+        .endif
+        .ifin(\rm, xmm,reg,imm)
+            gret 2
+        .endifin
+        .ifin(\rm, read,write)
+            gret 3
+        .endifin
+.endm
+
+# important: this is VEC_ARG_LIST^2
+.irp reg, VEC_ARG_LIST
+    .irp rm, VEC_ARG_LIST
+        do_vec_helper reg_\reg\()_\rm, \reg, \rm
+    .endr
+.endr
+.gadget_list vec_helper_reg, xmm_xmm,xmm_reg,xmm_imm,reg_xmm,reg_reg,reg_imm,imm_xmm,imm_reg,imm_imm
+
+.irp size, SIZE_LIST,64,128
+    .irp arg, VEC_ARG_LIST
+        do_vec_helper load\size\()_\arg, \arg, read, \size
+        do_vec_helper store\size\()_\arg, \arg, write, \size
+    .endr
+    .gadget_list vec_helper_load\size\(), VEC_ARG_LIST
+    .gadget_list vec_helper_store\size\(), VEC_ARG_LIST
 .endr
 
 .gadget fstsw_ax

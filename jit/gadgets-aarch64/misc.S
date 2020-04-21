@@ -1,4 +1,5 @@
 #include "gadgets.h"
+#include "math.h"
 
 .gadget cpuid
     # regrettable
@@ -21,54 +22,124 @@
     restore_c
     gret
 
-.gadget cmpxchg32_mem
-    write_prep 32, cmpxchg32_mem
-    ldr w8, [_xaddr]
-    subs w9, eax, w8
-    setf_zsp val=w9
-    setf_a eax, w8
-    setf_oc
-    csel eax, w8, eax, ne
-    csel w8, _tmp, w8, eq
-    cset w9, eq
-    str w8, [_xaddr]
-    write_done 32, cmpxchg32_mem
-    gret 1
-    write_bullshit 32, cmpxchg32_mem
+.macro do_cmpxchg size, s
+    .gadget cmpxchg\size\()_mem
+        write_prep \size, cmpxchg\size\()_mem
+        ldr\s w8, [_xaddr]
+        setf_a eax, w8
+        mov w9, eax
+        do_add sub, w9, w8, \s
+        setf_zsp \s, val=w9
+        .ifnb \s
+            cmp w9, 0
+            and w9, eax, (-1 << \size)
+            orr w8, w8, w9
+        .endif
+        csel eax, w8, eax, ne
+        csel w8, _tmp, w8, eq
+        cset w9, eq
+        str\s w8, [_xaddr]
+        write_done \size, cmpxchg\size\()_mem
+        gret 1
+        write_bullshit \size, cmpxchg\size\()_mem
+
+    .gadget atomic_cmpxchg\size\()_mem
+        write_prep \size, atomic_cmpxchg\size\()_mem
+        mov w12, eax
+        ldr w11, [_xaddr]
+    1:
+        mov w8, w11
+        setf_a eax, w8
+        mov w9, eax
+        do_add sub, w9, w8, \s
+        setf_zsp \s, val=w9
+        .ifnb \s
+            cmp w9, 0
+            and w9, eax, (-1 << \size)
+            orr w8, w8, w9
+        .endif
+        csel eax, w8, eax, ne
+        csel w8, _tmp, w8, eq
+        cset w9, eq
+
+        # all that setf stuff writes to memory which means instead of just using
+        # ldaxr and stlxr we now have to do *another* compare-and-exchange
+    2:
+        ldaxr\s w10, [_xaddr]
+        cmp w10, w11
+        b.ne 3f
+        stlxr\s w10, w8, [_xaddr]
+        cbnz w10, 2b
+
+        write_done \size, atomic_cmpxchg\size\()_mem
+        gret 1
+        write_bullshit \size, atomic_cmpxchg\size\()_mem
+    3:
+        dmb ish
+        mov w11, w10
+        mov eax, w12
+        b 1b
+.endm
+
+.irp size, SIZE_LIST
+    ss \size, do_cmpxchg
+.endr
 .gadget_array cmpxchg
-
-.gadget atomic_cmpxchg32_mem
-    write_prep 32, atomic_cmpxchg32_mem
-    mov w12, eax
-    ldr w11, [_xaddr]
-1:
-    mov w8, w11
-    subs w9, eax, w8
-    setf_zsp val=w9
-    setf_a eax, w8
-    setf_oc
-    csel eax, w8, eax, ne
-    csel w8, _tmp, w8, eq
-    cset w9, eq
-
-    # all that setf stuff writes to memory which means instead of just using
-    # ldaxr and stlxr we now have to do *another* compare-and-exchange
-2:
-    ldaxr w10, [_xaddr]
-    cmp w10, w11
-    b.ne 3f
-    stlxr w10, w8, [_xaddr]
-    cbnz w10, 2b
-
-    write_done 32, atomic_cmpxchg32_mem
-    gret 1
-    write_bullshit 32, atomic_cmpxchg32_mem
-3:
-    dmb ish
-    mov w11, w10
-    mov eax, w12
-    b 1b
 .gadget_array atomic_cmpxchg
+
+.gadget atomic_cmpxchg8b
+    write_prep 64, atomic_cmpxchg8b
+    mov w9, eax
+    bfi x9, xdx, 32, 32
+    mov w10, ebx
+    bfi x10, xcx, 32, 32
+
+1:
+    ldaxr x8, [_xaddr]
+    cmp x9, x8
+    csel x9, x8, x9, ne
+    csel x8, x10, x8, eq
+    cset w11, eq
+    stlxr w12, x8, [_xaddr]
+    cbnz w12, 1b
+    write_done 64, atomic_cmpxchg8b
+    ubfx xax, x9, 0, 32
+    ubfx xdx, x9, 32, 32
+
+    ldr w8, [_cpu, CPU_flags_res]
+    ldr w9, [_cpu, CPU_eflags]
+    and w8, w8, ~ZF_RES
+    bfi w9, w11, 6, 1
+    str w8, [_cpu, CPU_flags_res]
+    str w9, [_cpu, CPU_eflags]
+    gret 1
+    write_bullshit 64, atomic_cmpxchg8b
+
+.gadget cmpxchg8b
+    write_prep 64, cmpxchg8b
+    mov w9, eax
+    bfi x9, xdx, 32, 32
+    mov w10, ebx
+    bfi x10, xcx, 32, 32
+
+    ldr x8, [_xaddr]
+    cmp x9, x8
+    csel x9, x8, x9, ne
+    csel x8, x10, x8, eq
+    cset w11, eq
+    str x8, [_xaddr]
+    write_done 64, cmpxchg8b
+    ubfx xax, x9, 0, 32
+    ubfx xdx, x9, 32, 32
+
+    ldr w8, [_cpu, CPU_flags_res]
+    ldr w9, [_cpu, CPU_eflags]
+    and w8, w8, ~ZF_RES
+    bfi w9, w11, 6, 1
+    str w8, [_cpu, CPU_flags_res]
+    str w9, [_cpu, CPU_eflags]
+    gret 1
+    write_bullshit 64, cmpxchg8b
 
 .macro do_helper type, size=
     .gadget helper_\type\size
@@ -116,7 +187,19 @@ do_helper 2
     do_helper write, \size
 .endr
 
+# sync with enum vec_arg
+#define VEC_ARG_LIST xmm,reg
+
+# important: this is VEC_ARG_LIST^2
+.gadget_list vec_helper_reg, xmm_xmm,xmm_reg,reg_xmm,reg_reg
+
+.irp size, SIZE_LIST,64,128
+    .gadget_list vec_helper_load\size\(), VEC_ARG_LIST
+    .gadget_list vec_helper_store\size\(), VEC_ARG_LIST
+.endr
+
 .gadget fstsw_ax
     ldrh w10, [_cpu, CPU_fsw]
     movs eax, w10, h
     gret
+

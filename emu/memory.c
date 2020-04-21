@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <string.h>
@@ -8,8 +9,12 @@
 #define DEFAULT_CHANNEL memory
 #include "debug.h"
 #include "kernel/errno.h"
+#include "kernel/signal.h"
 #include "emu/memory.h"
 #include "jit/jit.h"
+#include "kernel/vdso.h"
+#include "kernel/task.h"
+#include "fs/fd.h"
 
 // increment the change count
 static void mem_changed(struct mem *mem);
@@ -18,7 +23,7 @@ void mem_init(struct mem *mem) {
     mem->pgdir = calloc(MEM_PGDIR_SIZE, sizeof(struct pt_entry *));
     mem->pgdir_used = 0;
     mem->changes = 0;
-#if JIT
+#if ENGINE_JIT
     mem->jit = jit_new(mem);
 #endif
     wrlock_init(&mem->lock);
@@ -26,8 +31,8 @@ void mem_init(struct mem *mem) {
 
 void mem_destroy(struct mem *mem) {
     write_wrlock(&mem->lock);
-    pt_unmap(mem, 0, MEM_PAGES, PT_FORCE);
-#if JIT
+    pt_unmap_always(mem, 0, MEM_PAGES);
+#if ENGINE_JIT
     jit_free(mem->jit);
 #endif
     for (int i = 0; i < MEM_PGDIR_SIZE; i++) {
@@ -67,6 +72,14 @@ static void mem_pt_del(struct mem *mem, page_t page) {
         entry->data = NULL;
 }
 
+void mem_next_page(struct mem *mem, page_t *page) {
+    (*page)++;
+    if (*page >= MEM_PAGES)
+        return;
+    while (*page < MEM_PAGES && mem->pgdir[PGDIR_TOP(*page)] == NULL)
+        *page = (*page - PGDIR_BOTTOM(*page)) + MEM_PGDIR_SIZE;
+}
+
 page_t pt_find_hole(struct mem *mem, pages_t size) {
     page_t hole_end;
     bool in_hole = false;
@@ -92,47 +105,66 @@ bool pt_is_hole(struct mem *mem, page_t start, pages_t pages) {
     return true;
 }
 
-int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, unsigned flags) {
+int pt_map(struct mem *mem, page_t start, pages_t pages, void *memory, size_t offset, unsigned flags) {
     if (memory == MAP_FAILED)
         return errno_map();
+
+    // If this fails, the munmap in pt_unmap would probably fail.
+    assert((uintptr_t) memory % real_page_size == 0 || memory == vdso_data);
 
     struct data *data = malloc(sizeof(struct data));
     if (data == NULL)
         return _ENOMEM;
-    data->data = memory;
-    data->size = pages * PAGE_SIZE;
-    data->refcount = 0;
+    *data = (struct data) {
+        .data = memory,
+        .size = pages * PAGE_SIZE + offset,
+
+#if LEAK_DEBUG
+        .pid = current ? current->pid : 0,
+        .dest = start << PAGE_BITS,
+#endif
+    };
 
     for (page_t page = start; page < start + pages; page++) {
         if (mem_pt(mem, page) != NULL)
-            pt_unmap(mem, page, 1, 0);
+            pt_unmap(mem, page, 1);
         data->refcount++;
         struct pt_entry *pt = mem_pt_new(mem, page);
         pt->data = data;
-        pt->offset = (page - start) << PAGE_BITS;
+        pt->offset = ((page - start) << PAGE_BITS) + offset;
         pt->flags = flags;
     }
     return 0;
 }
 
-int pt_unmap(struct mem *mem, page_t start, pages_t pages, int force) {
-    if (!force)
-        for (page_t page = start; page < start + pages; page++)
-            if (mem_pt(mem, page) == NULL)
-                return -1;
+int pt_unmap(struct mem *mem, page_t start, pages_t pages) {
+    for (page_t page = start; page < start + pages; page++)
+        if (mem_pt(mem, page) == NULL)
+            return -1;
+    return pt_unmap_always(mem, start, pages);
+}
 
-    for (page_t page = start; page < start + pages; page++) {
+int pt_unmap_always(struct mem *mem, page_t start, pages_t pages) {
+    for (page_t page = start; page < start + pages; mem_next_page(mem, &page)) {
         struct pt_entry *pt = mem_pt(mem, page);
-        if (pt != NULL) {
-#if JIT
-            jit_invalidate_page(mem->jit, page);
+        if (pt == NULL)
+            continue;
+#if ENGINE_JIT
+        jit_invalidate_page(mem->jit, page);
 #endif
-            struct data *data = pt->data;
-            mem_pt_del(mem, page);
-            if (--data->refcount == 0) {
-                munmap(data->data, data->size);
-                free(data);
+        struct data *data = pt->data;
+        mem_pt_del(mem, page);
+        if (--data->refcount == 0) {
+            // vdso wasn't allocated with mmap, it's just in our data segment
+            if (data->data != vdso_data) {
+                int err = munmap(data->data, data->size);
+                if (err != 0)
+                    die("munmap(%p, %lu) failed: %s", data->data, data->size, strerror(errno));
             }
+            if (data->fd != NULL) {
+                fd_close(data->fd);
+            }
+            free(data);
         }
     }
     mem_changed(mem);
@@ -143,7 +175,7 @@ int pt_map_nothing(struct mem *mem, page_t start, pages_t pages, unsigned flags)
     if (pages == 0) return 0;
     void *memory = mmap(NULL, pages * PAGE_SIZE,
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
-    return pt_map(mem, start, pages, memory, flags | P_ANON);
+    return pt_map(mem, start, pages, memory, 0, flags | P_ANONYMOUS);
 }
 
 int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
@@ -169,23 +201,21 @@ int pt_set_flags(struct mem *mem, page_t start, pages_t pages, int flags) {
     return 0;
 }
 
-int pt_copy_on_write(struct mem *src, page_t src_start, struct mem *dst, page_t dst_start, page_t pages) {
-    for (page_t src_page = src_start, dst_page = dst_start;
-            src_page < src_start + pages;
-            src_page++, dst_page++) {
-        struct pt_entry *entry = mem_pt(src, src_page);
-        if (entry != NULL) {
-            if (pt_unmap(dst, dst_page, 1, PT_FORCE) < 0)
-                return -1;
-            // TODO skip shared mappings
+int pt_copy_on_write(struct mem *src, struct mem *dst, page_t start, page_t pages) {
+    for (page_t page = start; page < start + pages; mem_next_page(src, &page)) {
+        struct pt_entry *entry = mem_pt(src, page);
+        if (entry == NULL)
+            continue;
+        if (pt_unmap_always(dst, page, 1) < 0)
+            return -1;
+        if (!(entry->flags & P_SHARED))
             entry->flags |= P_COW;
-            entry->flags &= ~P_COMPILED;
-            entry->data->refcount++;
-            struct pt_entry *dst_entry = mem_pt_new(dst, dst_page);
-            dst_entry->data = entry->data;
-            dst_entry->offset = entry->offset;
-            dst_entry->flags = entry->flags;
-        }
+        entry->flags &= ~P_COMPILED;
+        entry->data->refcount++;
+        struct pt_entry *dst_entry = mem_pt_new(dst, page);
+        dst_entry->data = entry->data;
+        dst_entry->offset = entry->offset;
+        dst_entry->flags = entry->flags;
     }
     mem_changed(src);
     mem_changed(dst);
@@ -210,7 +240,19 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             return NULL;
         if (!(mem_pt(mem, p)->flags & P_GROWSDOWN))
             return NULL;
+
+        // Changing memory maps must be done with the write lock. But this is
+        // called with the read lock, e.g. by tlb_handle_miss.
+        // This locking stuff is copy/pasted for all the code in this function
+        // which changes memory maps.
+        // TODO: factor the lock/unlock code here into a new function. Do this
+        // next time you touch this function.
+        read_wrunlock(&mem->lock);
+        write_wrlock(&mem->lock);
         pt_map_nothing(mem, page, 1, P_WRITE | P_GROWSDOWN);
+        write_wrunlock(&mem->lock);
+        read_wrlock(&mem->lock);
+
         entry = mem_pt(mem, page);
     }
 
@@ -224,9 +266,15 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
             void *copy = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
             memcpy(copy, data, PAGE_SIZE);
-            pt_map(mem, page, 1, copy, entry->flags &~ P_COW);
+
+            // copy/paste from above
+            read_wrunlock(&mem->lock);
+            write_wrlock(&mem->lock);
+            pt_map(mem, page, 1, copy, 0, entry->flags &~ P_COW);
+            write_wrunlock(&mem->lock);
+            read_wrlock(&mem->lock);
         }
-#if JIT
+#if ENGINE_JIT
         // get rid of any compiled blocks in this page
         jit_invalidate_page(mem->jit, page);
 #endif
@@ -237,7 +285,44 @@ void *mem_ptr(struct mem *mem, addr_t addr, int type) {
     return entry->data->data + entry->offset + PGOFFSET(addr);
 }
 
+int mem_segv_reason(struct mem *mem, addr_t addr) {
+    struct pt_entry *pt = mem_pt(mem, PAGE(addr));
+    if (pt == NULL)
+        return SEGV_MAPERR_;
+    return SEGV_ACCERR_;
+}
+
 size_t real_page_size;
 __attribute__((constructor)) static void get_real_page_size() {
     real_page_size = sysconf(_SC_PAGESIZE);
+}
+
+void mem_coredump(struct mem *mem, const char *file) {
+    int fd = open(file, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+        perror("open");
+        return;
+    }
+    if (ftruncate(fd, 0xffffffff) < 0) {
+        perror("ftruncate");
+        return;
+    }
+
+    int pages = 0;
+    for (page_t page = 0; page < MEM_PAGES; page++) {
+        struct pt_entry *entry = mem_pt(mem, page);
+        if (entry == NULL)
+            continue;
+        pages++;
+        if (lseek(fd, page << PAGE_BITS, SEEK_SET) < 0) {
+            perror("lseek");
+            return;
+        }
+        if (write(fd, entry->data->data, PAGE_SIZE) < 0) {
+            perror("write");
+            return;
+        }
+    }
+    printk("dumped %d pages\n", pages);
+    close(fd);
 }

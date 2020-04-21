@@ -3,6 +3,7 @@
 #include "emu/modrm.h"
 #include "emu/cpuid.h"
 #include "emu/fpu.h"
+#include "emu/sse.h"
 #include "emu/interrupt.h"
 
 static void gen(struct gen_state *state, unsigned long thing) {
@@ -27,6 +28,7 @@ void gen_start(addr_t addr, struct gen_state *state) {
     for (int i = 0; i <= 1; i++) {
         state->jump_ip[i] = 0;
     }
+    state->block_patch_ip = 0;
 
     struct jit_block *block = malloc(sizeof(struct jit_block) + state->capacity * sizeof(unsigned long));
     state->block = block;
@@ -46,11 +48,15 @@ void gen_end(struct gen_state *state) {
         list_init(&block->jumps_from[i]);
         list_init(&block->jumps_from_links[i]);
     }
+    if (state->block_patch_ip != 0) {
+        block->code[state->block_patch_ip] = (unsigned long) block;
+    }
     if (block->addr != state->ip)
         block->end_addr = state->ip - 1;
     else
         block->end_addr = block->addr;
     list_init(&block->chain);
+    block->is_jetsam = false;
     for (int i = 0; i <= 1; i++) {
         list_init(&block->page[i]);
     }
@@ -72,6 +78,7 @@ void gen_exit(struct gen_state *state) {
 #define FINISH \
     return !end_block
 
+#define RESTORE_IP state->ip = saved_ip
 #define _READIMM(name, size) \
     if (!tlb_read(tlb, state->ip, &name, size/8)) SEGFAULT; \
     state->ip += size/8
@@ -86,13 +93,15 @@ enum arg {
     arg_imm, arg_mem, arg_addr, arg_gs,
     arg_count, arg_invalid,
     // the following should not be synced with the list mentioned above (no gadgets implement them)
-    arg_modrm_val, arg_modrm_reg, arg_mem_addr, arg_1,
+    arg_modrm_val, arg_modrm_reg,
+    arg_xmm_modrm_val, arg_xmm_modrm_reg,
+    arg_mem_addr, arg_1,
 };
 
 enum size {
     size_8, size_16, size_32,
     size_count,
-    size_64, size_80, // FIXME bonus sizes, fpu only at the moment
+    size_64, size_80, size_128, // bonus sizes
 };
 
 // sync with COND_LIST in control.S
@@ -114,6 +123,8 @@ typedef void (*gadget_t)(void);
 #define gg(_g, a) do { g(_g); GEN(a); } while (0)
 #define ggg(_g, a, b) do { g(_g); GEN(a); GEN(b); } while (0)
 #define gggg(_g, a, b, c) do { g(_g); GEN(a); GEN(b); GEN(c); } while (0)
+#define ggggg(_g, a, b, c, d) do { g(_g); GEN(a); GEN(b); GEN(c); GEN(d); } while (0)
+#define gggggg(_g, a, b, c, d, e) do { g(_g); GEN(a); GEN(b); GEN(c); GEN(d); GEN(e); } while (0)
 #define ga(g, i) do { extern gadget_t g##_gadgets[]; if (g##_gadgets[i] == NULL) UNDEFINED; GEN(g##_gadgets[i]); } while (0)
 #define gag(g, i, a) do { ga(g, i); GEN(a); } while (0)
 #define gagg(g, i, a, b) do { ga(g, i); GEN(a); GEN(b); } while (0)
@@ -178,7 +189,6 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
             break;
     }
     if (arg >= arg_count || gadgets[arg] == NULL) {
-        debugger;
         UNDEFINED;
     }
     if (arg == arg_mem || arg == arg_addr) {
@@ -239,8 +249,26 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
 #define jcc(cc, to, else) gagg(jmp, cond_##cc, to, else); jump_ips(-2, -1); end_block = true
 #define J_REL(cc, off)  jcc(cc, fake_ip + off, fake_ip)
 #define JN_REL(cc, off) jcc(cc, fake_ip, fake_ip + off)
-#define CALL(loc) load(loc, OP_SIZE); ggg(call_indir, saved_ip, fake_ip); end_block = true
-#define CALL_REL(off) gggg(call, saved_ip, fake_ip + off, fake_ip); jump_ips(-2, 0); end_block = true
+
+// saved_ip: for use with page fault handler;
+// -1: will be patched to block address in gen_end();
+// fake_ip: the first one is the return address, used for saving to stack and verifying the cached ip in return cache is correct;
+// fake_ip: the second one is the return target, patchable by return chaining.
+#define CALL(loc) do { \
+    load(loc, OP_SIZE); \
+    ggggg(call_indir, saved_ip, -1, fake_ip, fake_ip); \
+    state->block_patch_ip = state->size - 3; \
+    jump_ips(-1, 0); \
+    end_block = true; \
+} while (0)
+// the first four arguments are the same with CALL,
+// the last one is the call target, patchable by return chaining.
+#define CALL_REL(off) do { \
+    gggggg(call, saved_ip, -1, fake_ip, fake_ip, fake_ip + off); \
+    state->block_patch_ip = state->size - 4; \
+    jump_ips(-2, -1); \
+    end_block = true; \
+} while (0)
 #define RET_NEAR(imm) ggg(ret, saved_ip, 4 + imm); end_block = true
 #define INT(code) ggg(interrupt, (uint8_t) code, state->ip); end_block = true
 
@@ -312,6 +340,7 @@ static inline bool gen_op(struct gen_state *state, gadget_t *gadgets, enum arg a
 #define REPNZ(op, z) strop(op, repnz, z)
 
 #define CMPXCHG(src, dst,z) load(src, z); op(cmpxchg, dst, z)
+#define CMPXCHG8B(dst,z) g_addr(); gg(cmpxchg8b, saved_ip)
 #define XADD(src, dst,z) XCHG(src, dst,z); ADD(src, dst,z)
 
 void helper_rdtsc(struct cpu_state *cpu);
@@ -331,16 +360,10 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define ATOMIC_DEC(val,z) op(atomic_dec, val, z)
 #define ATOMIC_CMPXCHG(src, dst,z) atomic_op(cmpxchg, src, dst, z)
 #define ATOMIC_XADD(src, dst,z) load(src, z); op(atomic_xadd, dst, z); store(src, z)
-
-// sse
-#define XORP(src, dst) UNDEFINED
-#define PSRLQ(src, dst) UNDEFINED
-#define PCMPEQD(src, dst) UNDEFINED
-#define PADD(src, dst) UNDEFINED
-#define PSUB(src, dst) UNDEFINED
-#define MOVQ(src, dst) UNDEFINED
-#define MOVD(src, dst) UNDEFINED
-#define CVTTSD2SI(src, dst) UNDEFINED
+#define ATOMIC_BTC(bit, val,z) lo(atomic_btc, val, bit, z)
+#define ATOMIC_BTS(bit, val,z) lo(atomic_bts, val, bit, z)
+#define ATOMIC_BTR(bit, val,z) lo(atomic_btr, val, bit, z)
+#define ATOMIC_CMPXCHG8B(dst,z) g_addr(); gg(atomic_cmpxchg8b, saved_ip)
 
 // fpu
 #define st_0 0
@@ -353,6 +376,7 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FXCH() hh(fpu_xch, st_i)
 #define FCOM() hh(fpu_com, st_i)
 #define FCOMM(val,z) h_read(fpu_comm, z)
+#define FICOM(val,z) h_read(fpu_icom, z)
 #define FUCOM() hh(fpu_ucom, st_i)
 #define FUCOMI() hh(fpu_ucomi, st_i)
 #define FCOMI() hh(fpu_comi, st_i)
@@ -371,7 +395,12 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FSTSW(dst) if (arg_##dst == arg_reg_a) g(fstsw_ax); else UNDEFINED
 #define FSTCW(dst) if (arg_##dst == arg_reg_a) UNDEFINED; else h_write(fpu_stcw, 16)
 #define FLDCW(dst) if (arg_##dst == arg_reg_a) UNDEFINED; else h_read(fpu_ldcw, 16)
+#define FSTENV(val,z) h_write(fpu_stenv, z)
+#define FLDENV(val,z) h_write(fpu_ldenv, z)
+#define FSAVE(val,z) h_write(fpu_save, z)
+#define FRESTORE(val,z) h_write(fpu_restore, z)
 #define FPOP h(fpu_pop)
+#define FINCSTP() h(fpu_incstp)
 #define FADD(src, dst) hhh(fpu_add, src, dst)
 #define FIADD(val,z) h_read(fpu_iadd, z)
 #define FADDM(val,z) h_read(fpu_addm, z)
@@ -391,6 +420,114 @@ void helper_rdtsc(struct cpu_state *cpu);
 #define FIDIVR(val,z) h_read(fpu_idivr, z)
 #define FDIVRM(val,z) h_read(fpu_divrm, z)
 #define FPATAN() h(fpu_patan)
+#define FSIN() h(fpu_sin)
+#define FCOS() h(fpu_cos)
+
+// vector
+
+// sync with VEC_ARG_LIST
+enum vec_arg {
+    vec_arg_xmm, vec_arg_reg, vec_arg_imm, vec_arg_count,
+    vec_arg_mem,
+};
+
+static inline enum vec_arg vecarg(enum arg arg, struct modrm *modrm) {
+    switch (arg) {
+        case arg_modrm_reg:
+            return vec_arg_reg;
+        case arg_imm:
+            return vec_arg_imm;
+        case arg_xmm_modrm_reg:
+            return vec_arg_xmm;
+        case arg_modrm_val:
+            if (modrm->type == modrm_reg)
+                return vec_arg_reg;
+            return vec_arg_mem;
+        case arg_xmm_modrm_val:
+            if (modrm->type == modrm_reg)
+                return vec_arg_xmm;
+            return vec_arg_mem;
+        default:
+            die("unimplemented vecarg");
+    }
+}
+
+static inline bool gen_vec(enum arg rm, enum arg reg, void (*helper)(), gadget_t (*helper_gadgets_mem)[vec_arg_count], struct gen_state *state, struct modrm *modrm, uint8_t imm, dword_t saved_ip, bool seg_gs) {
+    enum vec_arg v_reg = vecarg(reg, modrm);
+    enum vec_arg v_rm = vecarg(rm, modrm);
+
+    gadget_t gadget;
+    if (v_rm == vec_arg_mem) {
+        gadget = (*helper_gadgets_mem)[v_reg];
+    } else {
+        extern gadget_t vec_helper_reg_gadgets[vec_arg_count][vec_arg_count];
+        gadget = vec_helper_reg_gadgets[v_reg][v_rm];
+    }
+    if (gadget == NULL) {
+        UNDEFINED;
+    }
+
+    switch (v_rm) {
+        case vec_arg_xmm:
+            GEN(gadget);
+            GEN(helper);
+            GEN((modrm->opcode * sizeof(union xmm_reg))
+                    | (modrm->rm_opcode * sizeof(union xmm_reg) << 8));
+            break;
+
+        case vec_arg_mem:
+            gen_addr(state, modrm, seg_gs, saved_ip);
+            GEN(gadget);
+            GEN(saved_ip);
+            GEN(helper);
+            GEN(modrm->opcode * sizeof(union xmm_reg));
+            break;
+
+        case vec_arg_imm:
+            // TODO: support immediates and opcode
+            GEN(gadget);
+            GEN(helper);
+            GEN((modrm->rm_opcode * sizeof(union xmm_reg))
+                    | (((uint16_t) imm) << 8));
+            break;
+
+        default: die("unimplemented vecarg");
+    }
+    return true;
+}
+
+#define _v(src, dst, helper, helper_gadgets, z) do { \
+    extern gadget_t helper_gadgets[vec_arg_count]; \
+    if (!gen_vec(src, dst, (void (*)()) helper, &helper_gadgets, state, &modrm, 0, saved_ip, seg_gs)) return false; \
+} while (0)
+#define _v_imm(imm, dst, helper, helper_gadgets, z) do { \
+    extern gadget_t helper_gadgets[vec_arg_count]; \
+    if (!gen_vec(arg_imm, dst, (void (*)()) helper, &helper_gadgets, state, &modrm, imm, saved_ip, seg_gs)) return false; \
+} while (0)
+#define v(op, src, dst,z) _v(arg_##src, arg_##dst, vec_##op##z, vec_helper_load##z##_gadgets, z)
+#define v_imm(op, imm, dst,z) _v_imm(imm, arg_##dst, vec_##op##z, vec_helper_load##z##_gadgets, z)
+#define v_write(op, src, dst,z) _v(arg_##dst, arg_##src, vec_##op##z, vec_helper_store##z##_gadgets, z)
+
+#define VLOAD(src, dst,z) v(load, src, dst,z)
+#define VZLOAD(src, dst,z) v(zload, src, dst, z)
+#define VLOAD_PADNOTMEM(src, dst, z) do { \
+    if (arg_##src == arg_xmm_modrm_val && modrm.type != modrm_mem) { \
+        VZLOAD(src, dst, z); \
+    } else { \
+        VLOAD(src, dst, z); \
+    } \
+} while (0)
+#define VLOAD_PADMEM(src, dst, z) do { \
+    if (arg_##src == arg_xmm_modrm_val && modrm.type != modrm_reg) { \
+        VZLOAD(src, dst, z); \
+    } else { \
+        VLOAD(src, dst, z); \
+    } \
+} while (0)
+#define VSTORE(src, dst,z) v_write(store, src, dst,z)
+#define VCOMPARE(src, dst,z) v(compare, src, dst,z)
+#define VSHIFTR_IMM(reg, amount, z) v_imm(imm_shiftr, amount, reg,z)
+#define VXOR(src, dst,z) v(xor, src, dst,z)
 
 #define DECODER_RET int
 #define DECODER_NAME gen_step

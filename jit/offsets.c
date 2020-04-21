@@ -33,6 +33,7 @@ void cpu() {
     OFFSET(CPU, cpu_state, flags_res);
     OFFSET(CPU, cpu_state, df_offset);
     OFFSET(CPU, cpu_state, fsw);
+    OFFSET(CPU, cpu_state, xmm);
     MACRO(PF_RES);
     MACRO(ZF_RES);
     MACRO(SF_RES);
@@ -47,7 +48,10 @@ void cpu() {
     OFFSET(LOCAL, jit_frame, value);
     OFFSET(LOCAL, jit_frame, value_addr);
     OFFSET(LOCAL, jit_frame, last_block);
+    OFFSET(LOCAL, jit_frame, ret_cache);
     OFFSET(CPU, cpu_state, segfault_addr);
+    MACRO(MEM_READ);
+    MACRO(MEM_WRITE);
 
     OFFSET(JIT_BLOCK, jit_block, code);
 

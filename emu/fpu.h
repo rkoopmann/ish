@@ -2,6 +2,8 @@
 #define EMU_FPU_H
 #include "emu/float80.h"
 struct cpu_state;
+struct fpu_env32;
+struct fpu_state32;
 
 typedef float float32;
 typedef double float64;
@@ -27,6 +29,7 @@ static float80 fpu_consts[] = {
 
 void fpu_pop(struct cpu_state *cpu);
 void fpu_xch(struct cpu_state *cpu, int i);
+void fpu_incstp(struct cpu_state *cpu);
 
 void fpu_st(struct cpu_state *cpu, int i);
 void fpu_ist16(struct cpu_state *cpu, int16_t *i);
@@ -57,6 +60,8 @@ void fpu_2xm1(struct cpu_state *cpu);
 void fpu_com(struct cpu_state *cpu, int i);
 void fpu_comm32(struct cpu_state *cpu, float *f);
 void fpu_comm64(struct cpu_state *cpu, double *f);
+void fpu_icom16(struct cpu_state *cpu, int16_t *i);
+void fpu_icom32(struct cpu_state *cpu, int32_t *i);
 void fpu_comi(struct cpu_state *cpu, int i);
 void fpu_tst(struct cpu_state *cpu);
 #define fpu_ucom fpu_com
@@ -93,9 +98,16 @@ void fpu_mulm64(struct cpu_state *cpu, double *f);
 void fpu_divm64(struct cpu_state *cpu, double *f);
 void fpu_divrm64(struct cpu_state *cpu, double *f);
 
+void fpu_patan(struct cpu_state *cpu);
+void fpu_sin(struct cpu_state *cpu);
+void fpu_cos(struct cpu_state *cpu);
+void fpu_xam(struct cpu_state *cpu);
+
 void fpu_stcw16(struct cpu_state *cpu, uint16_t *i);
 void fpu_ldcw16(struct cpu_state *cpu, uint16_t *i);
-void fpu_patan(struct cpu_state *cpu);
-void fpu_xam(struct cpu_state *cpu);
+void fpu_stenv32(struct cpu_state *cpu, struct fpu_env32 *env);
+void fpu_ldenv32(struct cpu_state *cpu, struct fpu_env32 *env);
+void fpu_save32(struct cpu_state *cpu, struct fpu_state32 *state);
+void fpu_restore32(struct cpu_state *cpu, struct fpu_state32 *state);
 
 #endif

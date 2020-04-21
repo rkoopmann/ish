@@ -80,15 +80,15 @@ static CGPoint anchors[] = {
     if (self.accessibilityUpDown)
         self.direction = ArrowUp;
     else
-        self.direction = ArrowRight; // this might be wrong in RTL
-    [self.timer invalidate];
+        self.direction = ArrowLeft; // this might be wrong in RTL
+    self.direction = ArrowNone;
 }
 - (void)accessibilityDecrement {
     if (self.accessibilityUpDown)
         self.direction = ArrowDown;
     else
-        self.direction = ArrowLeft;
-    [self.timer invalidate];
+        self.direction = ArrowRight;
+    self.direction = ArrowNone;
 }
 
 - (void)addTextLayer:(NSString *)text direction:(ArrowDirection)direction {
@@ -155,14 +155,6 @@ static CGPoint anchors[] = {
     self.direction = ArrowNone;
 }
 
-- (void)chooseBackground {
-    if (self.selected || self.highlighted) {
-        self.backgroundColor = self.highlightedColor;
-    } else {
-        self.backgroundColor = self.defaultColor;
-    }
-}
-
 - (void)animateLayerUpdates {
     [UIView animateWithDuration:0.25 animations:^{
         for (int d = ArrowUp; d <= ArrowRight; d++) {
@@ -219,7 +211,9 @@ static CGPoint anchors[] = {
     if (self.selected) {
         self.backgroundColor = self.highlightedColor;
     } else {
-        self.backgroundColor = self.defaultColor;
+        [UIView animateWithDuration:0 delay:0.1 options:UIViewAnimationOptionAllowUserInteraction animations:^{
+            self.backgroundColor = self.defaultColor;
+        } completion:nil];
     }
     for (int d = ArrowUp; d <= ArrowRight; d++) {
         CATextLayer *layer = (CATextLayer *) arrowLayers[d];

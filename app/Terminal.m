@@ -5,15 +5,19 @@
 //  Created by Theodore Dubois on 10/18/17.
 //
 
-#include <iconv.h>
 #import "Terminal.h"
 #import "DelayedUITask.h"
 #import "UserPreferences.h"
+#include "fs/devices.h"
 #include "fs/tty.h"
+#include "fs/devices.h"
+
+extern struct tty_driver ios_pty_driver;
 
 @interface Terminal () <WKScriptMessageHandler>
 
 @property WKWebView *webView;
+@property BOOL loaded;
 @property (nonatomic) struct tty *tty;
 @property NSMutableData *pendingData;
 
@@ -21,6 +25,9 @@
 @property DelayedUITask *scrollToBottomTask;
 
 @property BOOL applicationCursor;
+
+@property NSNumber *terminalsKey;
+@property NSUUID *uuid;
 
 @end
 
@@ -34,40 +41,65 @@
 
 @implementation Terminal
 
-static Terminal *terminal = nil;
+static NSMapTable<NSNumber *, Terminal *> *terminals;
+static NSMapTable<NSUUID *, Terminal *> *terminalsByUUID;
 
-- (instancetype)init {
+- (instancetype)initWithType:(int)type number:(int)num {
+    self.terminalsKey = @(dev_make(type, num));
+    Terminal *terminal = [terminals objectForKey:self.terminalsKey];
     if (terminal)
         return terminal;
+    
     if (self = [super init]) {
         self.pendingData = [NSMutableData new];
         self.refreshTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(refresh)];
         self.scrollToBottomTask = [[DelayedUITask alloc] initWithTarget:self action:@selector(scrollToBottom)];
         
         WKWebViewConfiguration *config = [WKWebViewConfiguration new];
+        [config.userContentController addScriptMessageHandler:self name:@"load"];
         [config.userContentController addScriptMessageHandler:self name:@"log"];
+        [config.userContentController addScriptMessageHandler:self name:@"sendInput"];
         [config.userContentController addScriptMessageHandler:self name:@"resize"];
         [config.userContentController addScriptMessageHandler:self name:@"propUpdate"];
-        self.webView = [[CustomWebView alloc] initWithFrame:CGRectZero configuration:config];
+        // Make the web view really big so that if a program tries to write to the terminal before it's displayed, the text probably won't wrap too badly.
+        CGRect webviewSize = CGRectMake(0, 0, 10000, 10000);
+        self.webView = [[CustomWebView alloc] initWithFrame:webviewSize configuration:config];
         self.webView.scrollView.scrollEnabled = NO;
-        [self.webView loadRequest:
-         [NSURLRequest requestWithURL:
-          [NSBundle.mainBundle URLForResource:@"xterm-dist/term" withExtension:@"html"]]];
-        [self.webView addObserver:self forKeyPath:@"loading" options:0 context:NULL];
-        [self _addPreferenceObservers];
-        terminal = self;
+        NSURL *xtermHtmlFile = [NSBundle.mainBundle URLForResource:@"term" withExtension:@"html"];
+        [self.webView loadFileURL:xtermHtmlFile allowingReadAccessToURL:xtermHtmlFile];
+        
+        [terminals setObject:self forKey:self.terminalsKey];
+        self.uuid = [NSUUID UUID];
+        [terminalsByUUID setObject:self forKey:self.uuid];
     }
     return self;
 }
 
++ (Terminal *)createPseudoTerminal:(struct tty **)tty {
+    *tty = pty_open_fake(&ios_pty_driver);
+    if (IS_ERR(*tty))
+        return nil;
+    return (__bridge Terminal *) (*tty)->data;
+}
+
 - (void)setTty:(struct tty *)tty {
     _tty = tty;
-    [self syncWindowSize];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self syncWindowSize];
+    });
 }
 
 - (void)userContentController:(WKUserContentController *)userContentController didReceiveScriptMessage:(WKScriptMessage *)message {
-    if ([message.name isEqualToString:@"log"]) {
+    if ([message.name isEqualToString:@"load"]) {
+        self.loaded = YES;
+        [self.refreshTask schedule];
+        // make sure this setting works if it's set before loading
+        self.enableVoiceOverAnnounce = self.enableVoiceOverAnnounce;
+    } else if ([message.name isEqualToString:@"log"]) {
         NSLog(@"%@", message.body);
+    } else if ([message.name isEqualToString:@"sendInput"]) {
+        NSData *data = [message.body dataUsingEncoding:NSUTF8StringEncoding];
+        [self sendInput:data.bytes length:data.length];
     } else if ([message.name isEqualToString:@"resize"]) {
         [self syncWindowSize];
     } else if ([message.name isEqualToString:@"propUpdate"]) {
@@ -76,7 +108,7 @@ static Terminal *terminal = nil;
 }
 
 - (void)syncWindowSize {
-    [self.webView evaluateJavaScript:@"[term.cols, term.rows]" completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
+    [self.webView evaluateJavaScript:@"exports.getSize()" completionHandler:^(NSArray<NSNumber *> *dimensions, NSError *error) {
         if (self.tty == NULL) {
             return;
         }
@@ -88,6 +120,13 @@ static Terminal *terminal = nil;
     }];
 }
 
+- (void)setEnableVoiceOverAnnounce:(BOOL)enableVoiceOverAnnounce {
+    _enableVoiceOverAnnounce = enableVoiceOverAnnounce;
+    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"term.setAccessibilityEnabled(%@)",
+                                      enableVoiceOverAnnounce ? @"true" : @"false"]
+                   completionHandler:nil];
+}
+
 - (int)write:(const void *)buf length:(size_t)len {
     @synchronized (self) {
         [self.pendingData appendData:[NSData dataWithBytes:buf length:len]];
@@ -97,51 +136,19 @@ static Terminal *terminal = nil;
 }
 
 - (void)sendInput:(const char *)buf length:(size_t)len {
+    if (self.tty == NULL)
+        return;
     tty_input(self.tty, buf, len, 0);
+    [self.webView evaluateJavaScript:@"exports.setUserGesture()" completionHandler:nil];
     [self.scrollToBottomTask schedule];
 }
 
 - (void)scrollToBottom {
-    [self.webView evaluateJavaScript:@"term.scrollToBottom()" completionHandler:nil];
+    [self.webView evaluateJavaScript:@"exports.scrollToBottom()" completionHandler:nil];
 }
 
 - (NSString *)arrow:(char)direction {
     return [NSString stringWithFormat:@"\x1b%c%c", self.applicationCursor ? 'O' : '[', direction];
-}
-
-- (void)_addPreferenceObservers {
-    UserPreferences *prefs = [UserPreferences shared];
-    NSKeyValueObservingOptions opts = NSKeyValueObservingOptionNew;
-    [prefs addObserver:self forKeyPath:@"fontSize" options:opts context:nil];
-    [prefs addObserver:self forKeyPath:@"theme" options:opts context:nil];
-}
-
-- (NSString *)cssColor:(UIColor *)color {
-    CGFloat red, green, blue, alpha;
-    [color getRed:&red green:&green blue:&blue alpha:&alpha];
-    return [NSString stringWithFormat:@"rgba(%ld, %ld, %ld, %ld)",
-            lround(red * 255), lround(green * 255), lround(blue * 255), lround(alpha * 255)];
-}
-
-- (void)_updateStyleFromPreferences {
-    UserPreferences *prefs = [UserPreferences shared];
-    id themeInfo = @{
-                     @"fontSize": prefs.fontSize,
-                     @"foregroundColor": [self cssColor:prefs.theme.foregroundColor],
-                     @"backgroundColor": [self cssColor:prefs.theme.backgroundColor],
-                     };
-    NSString *json = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:themeInfo options:0 error:nil] encoding:NSUTF8StringEncoding];
-    [self.webView evaluateJavaScript:[NSString stringWithFormat:@"updateStyle(%@)", json] completionHandler:nil];
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary<NSKeyValueChangeKey,id> *)change context:(void *)context {
-    if (object == self.webView && [keyPath isEqualToString:@"loading"] && !self.webView.loading) {
-        [self _updateStyleFromPreferences];
-        [self.refreshTask schedule];
-        [self.webView removeObserver:self forKeyPath:@"loading"];
-    } else if (object == [UserPreferences shared]) {
-        [self _updateStyleFromPreferences];
-    }
 }
 
 NSData *removeInvalidUTF8(NSData *data) {
@@ -204,7 +211,7 @@ NSData *removeInvalidUTF8(NSData *data) {
 }
 
 - (void)refresh {
-    if (self.webView.loading)
+    if (!self.loaded)
         return;
     
     NSData *data;
@@ -214,48 +221,67 @@ NSData *removeInvalidUTF8(NSData *data) {
     }
     NSData *cleanData = removeInvalidUTF8(data);
     NSString *str = [[NSString alloc] initWithData:cleanData encoding:NSUTF8StringEncoding];
-    
+
     NSError *err = nil;
     NSData *jsonData = [NSJSONSerialization dataWithJSONObject:@[str] options:0 error:&err];
     NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
     NSAssert(err == nil, @"JSON serialization failed, wtf");
-    NSString *jsToEvaluate = [NSString stringWithFormat:@"termWrite(%@[0])", json];
+    NSString *jsToEvaluate = [NSString stringWithFormat:@"exports.write(%@[0])", json];
     [self.webView evaluateJavaScript:jsToEvaluate completionHandler:nil];
 }
 
++ (void)convertCommand:(NSArray<NSString *> *)command toArgs:(char *)argv limitSize:(size_t)maxSize {
+    char *p = argv;
+    for (NSString *cmd in command) {
+        const char *c = cmd.UTF8String;
+        // Save space for the final NUL byte in argv
+        while (p < argv + maxSize - 1 && (*p++ = *c++));
+        // If we reach the end of the buffer, the last string still needs to be
+        // NUL terminated
+        *p = '\0';
+    }
+    // Add the final NUL byte to argv
+    *++p = '\0';
+}
+
 + (Terminal *)terminalWithType:(int)type number:(int)number {
-    return [Terminal new];
+    return [[Terminal alloc] initWithType:type number:number];
+}
+
++ (Terminal *)terminalWithUUID:(NSUUID *)uuid {
+    return [terminalsByUUID objectForKey:uuid];
+}
+
+- (void)destroy {
+    if (self.tty != NULL) {
+        lock(&self.tty->lock);
+        tty_hangup(self.tty);
+        unlock(&self.tty->lock);
+    }
+    [terminals removeObjectForKey:self.terminalsKey];
+}
+
++ (void)initialize {
+    terminals = [NSMapTable strongToWeakObjectsMapTable];
+    terminalsByUUID = [NSMapTable strongToWeakObjectsMapTable];
 }
 
 @end
 
 static int ios_tty_init(struct tty *tty) {
-    Terminal *terminal = [Terminal terminalWithType:tty->type number:tty->num];
-    terminal.tty = tty;
-    tty->refcount++;
-    tty->data = (void *) CFBridgingRetain(terminal);
+    // This is called with ttys_lock but that results in deadlock since the main thread can also acquire ttys_lock. So release it.
+    unlock(&ttys_lock);
+    void (^init_block)(void) = ^{
+        Terminal *terminal = [Terminal terminalWithType:tty->type number:tty->num];
+        tty->data = (void *) CFBridgingRetain(terminal);
+        terminal.tty = tty;
+    };
+    if ([NSThread isMainThread])
+        init_block();
+    else
+        dispatch_sync(dispatch_get_main_queue(), init_block);
 
-    // termios
-    tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOCTL_;
-    tty->termios.iflags = ICRNL_;
-    tty->termios.oflags = OPOST_ | ONLCR_;
-    tty->termios.cc[VINTR_] = '\x03';
-    tty->termios.cc[VQUIT_] = '\x1c';
-    tty->termios.cc[VERASE_] = '\x7f';
-    tty->termios.cc[VKILL_] = '\x15';
-    tty->termios.cc[VEOF_] = '\x04';
-    tty->termios.cc[VTIME_] = 0;
-    tty->termios.cc[VMIN_] = 1;
-    tty->termios.cc[VSTART_] = '\x11';
-    tty->termios.cc[VSTOP_] = '\x13';
-    tty->termios.cc[VSUSP_] = '\x1a';
-    tty->termios.cc[VEOL_] = 0;
-    tty->termios.cc[VREPRINT_] = '\x12';
-    tty->termios.cc[VDISCARD_] = '\x0f';
-    tty->termios.cc[VWERASE_] = '\x17';
-    tty->termios.cc[VLNEXT_] = '\x16';
-    tty->termios.cc[VEOL2_] = 0;
-
+    lock(&ttys_lock);
     return 0;
 }
 
@@ -265,7 +291,9 @@ static int ios_tty_write(struct tty *tty, const void *buf, size_t len, bool bloc
 }
 
 static void ios_tty_cleanup(struct tty *tty) {
-    CFBridgingRelease(tty->data);
+    Terminal *terminal = CFBridgingRelease(tty->data);
+    tty->data = NULL;
+    terminal.tty = NULL;
 }
 
 struct tty_driver_ops ios_tty_ops = {
@@ -273,4 +301,5 @@ struct tty_driver_ops ios_tty_ops = {
     .write = ios_tty_write,
     .cleanup = ios_tty_cleanup,
 };
-DEFINE_TTY_DRIVER(ios_tty_driver, &ios_tty_ops, 1);
+DEFINE_TTY_DRIVER(ios_console_driver, &ios_tty_ops, TTY_CONSOLE_MAJOR, 64);
+struct tty_driver ios_pty_driver = {.ops = &ios_tty_ops};

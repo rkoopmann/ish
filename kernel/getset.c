@@ -143,20 +143,26 @@ int_t sys_getresgid(addr_t rgid_addr, addr_t egid_addr, addr_t sgid_addr) {
 }
 
 int_t sys_getgroups(dword_t size, addr_t list) {
+    STRACE("getgroups(%d, %#x)", size, list);
     if (size == 0)
         return current->ngroups;
     if (size < current->ngroups)
         return _EINVAL;
-    if (user_write(list, current->groups, size * sizeof(uid_t_)))
+    for (unsigned i = 0; i < current->ngroups; i++)
+        STRACE(" %d", current->groups[i]);
+    if (user_write(list, current->groups, current->ngroups * sizeof(uid_t_)))
         return _EFAULT;
-    return 0;
+    return current->ngroups;
 }
 
 int_t sys_setgroups(dword_t size, addr_t list) {
+    STRACE("setgroups(%d, %#x)", size, list);
     if (size > MAX_GROUPS)
         return _EINVAL;
     if (user_read(list, current->groups, size * sizeof(uid_t_)))
         return _EFAULT;
+    for (unsigned i = 0; i < size; i++)
+        STRACE(" %d", current->groups[i]);
     current->ngroups = size;
     return 0;
 }
@@ -169,4 +175,13 @@ int_t sys_capget(addr_t header_addr, addr_t data_addr) {
 int_t sys_capset(addr_t header_addr, addr_t data_addr) {
     STRACE("capset(%#x, %#x)", header_addr, data_addr);
     return 0;
+}
+
+// minimal version according to Linux sys/personality.h
+int_t sys_personality(dword_t pers) {
+    if (pers == 0xffffffff)  // get personality, return default (Linux)
+        return 0x00000000;
+    if (pers == 0x00000000)  // set personality to Linux
+        return 0x00000000;
+    return _EINVAL;  // otherwise return error
 }

@@ -8,7 +8,10 @@
 #import <UIKit/UIKit.h>
 #import "Terminal.h"
 
-@interface TerminalView : UIView <UIKeyInput, WKScriptMessageHandler>
+@interface TerminalView : UIView <UITextInput, WKScriptMessageHandler, UIScrollViewDelegate>
+
+@property (nonatomic) CGFloat overrideFontSize;
+@property (readonly) CGFloat effectiveFontSize;
 
 @property (nonatomic) UIKeyboardAppearance keyboardAppearance;
 
@@ -16,6 +19,5 @@
 @property (weak) IBOutlet UIButton *controlKey;
 
 @property (nonatomic) Terminal *terminal;
-@property (readonly) UIScrollView *scrollView;
 
 @end

@@ -52,7 +52,7 @@ int generic_unlinkat(struct fd *at, const char *path);
 int generic_rmdirat(struct fd *at, const char *path);
 int generic_renameat(struct fd *src_at, const char *src, struct fd *dst_at, const char *dst);
 int generic_symlinkat(const char *target, struct fd *at, const char *link);
-int generic_mknod(const char *path, mode_t_ mode, dev_t_ dev);
+int generic_mknodat(struct fd *at, const char *path, mode_t_ mode, dev_t_ dev);
 #define AC_R 4
 #define AC_W 2
 #define AC_X 1
@@ -64,9 +64,13 @@ int generic_utime(struct fd *at, const char *path, struct timespec atime, struct
 ssize_t generic_readlinkat(struct fd *at, const char *path, char *buf, size_t bufsize);
 int generic_mkdirat(struct fd *at, const char *path, mode_t_ mode);
 
+int access_check(struct statbuf *stat, int check);
+
 struct mount {
     const char *point;
     const char *source;
+    const char *info;
+    int flags;
     const struct fs_ops *fs;
     unsigned refcount;
     struct list mounts;
@@ -89,6 +93,8 @@ struct mount {
                 sqlite3_stmt *path_link;
                 sqlite3_stmt *path_unlink;
                 sqlite3_stmt *path_rename;
+                sqlite3_stmt *path_from_inode;
+                sqlite3_stmt *try_cleanup_inode;
             } stmt;
             lock_t lock;
         };
@@ -98,29 +104,36 @@ extern lock_t mounts_lock;
 
 // returns a reference, which must be released
 struct mount *mount_find(char *path);
+void mount_retain(struct mount *mount);
 void mount_release(struct mount *mount);
 
 // must hold mounts_lock while calling these, or traversing mounts
-int do_mount(const struct fs_ops *fs, const char *source, const char *point);
+int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags);
 int do_umount(const char *point);
 int mount_remove(struct mount *mount);
 extern struct list mounts;
 
+bool mount_param_flag(const char *info, const char *flag);
+
 // open flags
+#define O_ACCMODE_ 3
 #define O_RDONLY_ 0
 #define O_WRONLY_ (1 << 0)
 #define O_RDWR_ (1 << 1)
 #define O_CREAT_ (1 << 6)
+#define O_EXCL_ (1 << 7)
 #define O_NOCTTY_ (1 << 8)
 #define O_TRUNC_ (1 << 9)
 #define O_APPEND_ (1 << 10)
 #define O_NONBLOCK_ (1 << 11)
+#define O_DIRECTORY_ (1 << 16)
 #define O_CLOEXEC_ (1 << 19)
 
 // generic ioctls
 #define FIONREAD_ 0x541b
 #define FIONBIO_ 0x5421
 
+// All operations are optional unless otherwise specified
 struct fs_ops {
     const char *name;
     int magic;
@@ -131,7 +144,8 @@ struct fs_ops {
 
     struct fd *(*open)(struct mount *mount, const char *path, int flags, int mode); // required
     ssize_t (*readlink)(struct mount *mount, const char *path, char *buf, size_t bufsize);
-    // TODO make these optional (EROFS probably)
+
+    // These return _EPERM if not present
     int (*link)(struct mount *mount, const char *src, const char *dst);
     int (*unlink)(struct mount *mount, const char *path);
     int (*rmdir)(struct mount *mount, const char *path);
@@ -146,43 +160,32 @@ struct fs_ops {
     // If they are the same function, it will only be called once.
     int (*close)(struct fd *fd);
 
-    int (*stat)(struct mount *mount, const char *path, struct statbuf *stat, bool follow_links);
-    int (*fstat)(struct fd *fd, struct statbuf *stat);
+    int (*stat)(struct mount *mount, const char *path, struct statbuf *stat); // required
+    int (*fstat)(struct fd *fd, struct statbuf *stat); // required
     int (*setattr)(struct mount *mount, const char *path, struct attr attr);
     int (*fsetattr)(struct fd *fd, struct attr attr);
     int (*utime)(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime);
     // Returns the path of the file descriptor, null terminated, buf must be at least MAX_PATH+1
-    int (*getpath)(struct fd *fd, char *buf);
+    int (*getpath)(struct fd *fd, char *buf); // required
 
     int (*flock)(struct fd *fd, int operation);
+
+    // If present, called when all references to an inode_data for this
+    // filesystem go away.
+    void (*inode_orphaned)(struct mount *mount, ino_t inode);
 };
 
 struct mount *find_mount_and_trim_path(char *path);
 const char *fix_path(const char *path); // TODO reconsider
 
-// real fs
-extern const struct fd_ops realfs_fdops;
-
-int realfs_truncate(struct mount *mount, const char *path, off_t_ size);
-int realfs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime);
-
-int realfs_statfs(struct mount *mount, struct statfsbuf *stat);
-int realfs_flock(struct fd *fd, int operation);
-int realfs_getpath(struct fd *fd, char *buf);
-ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize);
-ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize);
-int realfs_poll(struct fd *fd);
-int realfs_getflags(struct fd *fd);
-int realfs_setflags(struct fd *fd, dword_t arg);
-int realfs_close(struct fd *fd);
-
 // adhoc fs
 struct fd *adhoc_fd_create(const struct fd_ops *ops);
 
 // filesystems
-extern const struct fs_ops realfs;
 extern const struct fs_ops procfs;
 extern const struct fs_ops fakefs;
 extern const struct fs_ops devptsfs;
+extern const struct fs_ops tmpfs;
+void fs_register(const struct fs_ops *fs);
 
 #endif

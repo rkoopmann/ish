@@ -39,6 +39,7 @@ static inline int step(int pid) {
     trycall(waitpid(pid, &status, 0), "wait step");
     if (WIFSTOPPED(status) && WSTOPSIG(status) != SIGTRAP) {
         int signal = WSTOPSIG(status);
+        printk("child received signal %d\n", signal);
         // a signal arrived, we now have to actually deliver it
         trycall(ptrace(PTRACE_SINGLESTEP, pid, NULL, signal), "ptrace step");
         trycall(waitpid(pid, &status, 0), "wait step");
@@ -91,8 +92,8 @@ static int compare_cpus(struct cpu_state *cpu, struct tlb *tlb, int pid, int und
         return -1;
     }
 #define CHECK_XMMREG(i) \
-    CHECK(*(uint64_t *) &fpregs.xmm_space[i * 2],   cpu->xmm[i].qw[0], "xmm" #i " low") \
-    CHECK(*(uint64_t *) &fpregs.xmm_space[(i+1)*2], cpu->xmm[i].qw[1], "xmm" #i " high")
+    CHECK(*(uint64_t *) &fpregs.xmm_space[i * 4],   cpu->xmm[i].qw[0], "xmm" #i " low") \
+    CHECK(*(uint64_t *) &fpregs.xmm_space[i*4+2], cpu->xmm[i].qw[1], "xmm" #i " high")
     CHECK_XMMREG(0);
     CHECK_XMMREG(1);
     CHECK_XMMREG(2);
@@ -254,7 +255,7 @@ static void pt_copy_to_real(int pid, addr_t start, size_t size) {
 static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int sender, int receiver) {
     // step fake cpu
     cpu->tf = 1;
-    int changes = cpu->mem->changes;
+    unsigned changes = cpu->mem->changes;
     int interrupt = cpu_step32(cpu, tlb);
     if (interrupt != INT_NONE) {
         cpu->trapno = interrupt;
@@ -347,7 +348,7 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             case 140: // _llseek
                 pt_copy(pid, regs.rsi, 8); break;
             case 145: { // readv
-                struct io_vec vecs[regs.rdx];
+                struct iovec_ vecs[regs.rdx];
                 (void) user_get(regs.rcx, vecs);
                 for (unsigned i = 0; i < regs.rdx; i++)
                     pt_copy(pid, vecs[i].base, vecs[i].len);
@@ -390,6 +391,7 @@ static void step_tracing(struct cpu_state *cpu, struct tlb *tlb, int pid, int se
             // some syscalls need to just happen
             case 45: // brk
             case 91: // munmap
+            case 119: // sigreturn
             case 125: // mprotect
             case 173: // rt_sigreturn
             case 174: // rt_sigaction
@@ -457,9 +459,9 @@ static void prepare_tracee(int pid) {
 }
 
 int main(int argc, char *const argv[]) {
-    char *const *envp = NULL;
+    char envp[100] = {0};
     if (getenv("TERM"))
-        envp = (char *[]) {getenv("TERM") - strlen("TERM") - 1, NULL};
+        strcpy(envp, getenv("TERM") - strlen("TERM") - 1);
     int err = xX_main_Xx(argc, argv, envp);
     if (err < 0) {
         fprintf(stderr, "%s\n", strerror(-err));
@@ -468,7 +470,7 @@ int main(int argc, char *const argv[]) {
 
     // execute the traced program in a new process and throw up some sockets
     char exec_path[MAX_PATH];
-    if (path_normalize(AT_PWD, argv[optind], exec_path, true) != 0) {
+    if (path_normalize(AT_PWD, argv[optind], exec_path, N_SYMLINK_FOLLOW) != 0) {
         fprintf(stderr, "enametoolong\n"); exit(1);
     }
     struct mount *mount = find_mount_and_trim_path(exec_path);

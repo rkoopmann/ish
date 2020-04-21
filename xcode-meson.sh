@@ -4,7 +4,8 @@ cd $MESON_BUILD_DIR
 
 config=$(meson introspect --buildoptions)
 if [[ $? -ne 0 ]]; then
-    export CC="env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET clang"
+    export CC_FOR_BUILD="env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET clang"
+    export CC="$CC_FOR_BUILD" # compatibility with meson < 0.54.0
     crossfile=cross.txt
     echo $ARCHS
     arch=${ARCHS%% *}
@@ -29,7 +30,8 @@ endian = 'little'
 c_args = ['-arch', '$arch']
 needs_exe_wrapper = true
 EOF
-    meson $SRCROOT --cross-file $crossfile
+    meson $SRCROOT --cross-file $crossfile || exit $?
+    config=$(meson introspect --buildoptions)
 fi
 
 buildtype=debug
@@ -43,7 +45,7 @@ log=$ISH_LOG
 log_handler=nslog
 jit=true
 for var in buildtype log b_ndebug b_sanitize log_handler jit; do
-    old_value=$(jq -r ".[] | select(.name==\"$var\") | .value" <<< $config)
+    old_value=$(python3 -c "import sys, json; v = next(x['value'] for x in json.load(sys.stdin) if x['name'] == '$var'); print(str(v).lower() if isinstance(v, bool) else v)" <<< $config)
     new_value=${!var}
     if [[ $old_value != $new_value ]]; then
         meson configure "-D$var=$new_value"

@@ -2,7 +2,7 @@ macros:
     - &linux
       language: c
       os: linux
-      dist: xenial
+      dist: bionic
       compiler: clang
       addons:
           apt:
@@ -13,16 +13,17 @@ macros:
           - pip install meson
       script:
           - meson build $MESON_OPTS
-          - ninja -C build
+          - ninja -C build $NINJA_TARGET
 
 matrix:
     include:
         - <<: *linux
-          env: MESON_OPTS=-Djit=true
-        - <<: *linux
-          env: MESON_OPTS=-Djit=false
+          env:
+              - MESON_OPTS=-Dengine=jit
+              - NINJA_TARGET=test
         - language: objective-c
-          osx_image: xcode10.1
+          os: osx
+          osx_image: xcode11
           install:
               - pip3 install meson
           addons:
@@ -30,9 +31,6 @@ matrix:
                   packages:
                       - ninja
                       - llvm
-                      - yarn
+                  update: true
           script:
               - xcodebuild -project iSH.xcodeproj -scheme iSH -sdk iphoneos CODE_SIGNING_ALLOWED=NO
-    exclude:
-        - language: objective-c
-          env: MESON_OPTS=-Djit=false

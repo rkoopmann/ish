@@ -38,8 +38,11 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     list_init(&group->threads);
     list_add(&old_group->pgroup, &group->pgroup);
     list_add(&old_group->session, &group->session);
-    if (group->tty)
+    if (group->tty) {
+        lock(&group->tty->lock);
         group->tty->refcount++;
+        unlock(&group->tty->lock);
+    }
     group->timer = NULL;
     group->doing_group_exit = false;
     group->children_rusage = (struct rusage_) {};
@@ -59,8 +62,7 @@ static int copy_task(struct task *task, dword_t flags, addr_t stack, addr_t ptid
     if (flags & CLONE_VM_) {
         mm_retain(mm);
     } else {
-        task->mm = mm_copy(mm);
-        task->mem = task->cpu.mem = &task->mm->mem;
+        task_set_mm(task, mm_copy(mm));
     }
 
     if (flags & CLONE_FILES_) {
@@ -149,7 +151,13 @@ dword_t sys_clone(dword_t flags, addr_t stack, addr_t ptid, addr_t tls, addr_t c
         return _ENOMEM;
     int err = copy_task(task, flags, stack, ptid, tls, ctid);
     if (err < 0) {
+        // FIXME: there is a window between task_create_ and task_destroy where
+        // some other thread could get a pointer to the task.
+        // FIXME: task_destroy doesn't free all aspects of the task, which
+        // could cause leaks
+        lock(&pids_lock);
         task_destroy(task);
+        unlock(&pids_lock);
         return err;
     }
     task->cpu.eax = 0;

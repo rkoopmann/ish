@@ -13,6 +13,11 @@ typedef NS_ENUM(NSInteger, CapsLockMapping) {
     CapsLockMapEscape,
 };
 
+typedef enum : NSUInteger {
+    OptionMapNone = 0,
+    OptionMapEsc,
+} OptionMapping;
+
 NS_ASSUME_NONNULL_BEGIN
 
 @interface Theme : NSObject
@@ -35,16 +40,23 @@ extern NSString *const kThemeBackgroundColor;
 
 @interface UserPreferences : NSObject
 
-@property (nonatomic) CapsLockMapping capsLockMapping;
+@property CapsLockMapping capsLockMapping;
+@property OptionMapping optionMapping;
+@property BOOL backtickMapEscape;
 @property (nonatomic) Theme *theme;
-@property (nonatomic) BOOL shouldDisableDimming;
-@property (nonatomic, copy) NSNumber *fontSize;
-@property (nonatomic) NSArray<NSString *> *launchCommand;
+@property BOOL shouldDisableDimming;
+@property NSString *fontFamily;
+@property NSNumber *fontSize;
+@property NSArray<NSString *> *launchCommand;
+@property NSArray<NSString *> *bootCommand;
 
 + (instancetype)shared;
 
 - (BOOL)hasChangedLaunchCommand;
 
 @end
+
+extern NSString *const kPreferenceLaunchCommandKey;
+extern NSString *const kPreferenceBootCommandKey;
 
 NS_ASSUME_NONNULL_END

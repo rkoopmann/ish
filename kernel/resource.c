@@ -8,59 +8,130 @@
 #else
 #error
 #endif
+
+#include <limits.h>
+#include <string.h>
 #include "kernel/calls.h"
 
-struct rlimit_ rlimit_get(struct task *task, int resource) {
-    struct tgroup *group = task->group;
-    lock(&group->lock);
-    struct rlimit_ limit = group->limits[resource];
-    unlock(&group->lock);
-    return limit;
+static bool resource_valid(int resource) {
+    return resource >= 0 && resource < RLIMIT_NLIMITS_;
 }
 
-void rlimit_set(struct task *task, int resource, struct rlimit_ limit) {
+static int rlimit_get(struct task *task, int resource, struct rlimit_ *limit) {
+    if (!resource_valid(resource))
+        return _EINVAL;
+    struct tgroup *group = task->group;
+    lock(&group->lock);
+    *limit = group->limits[resource];
+    unlock(&group->lock);
+    return 0;
+}
+
+static int rlimit_set(struct task *task, int resource, struct rlimit_ limit) {
+    if (!resource_valid(resource))
+        return _EINVAL;
     struct tgroup *group = task->group;
     lock(&group->lock);
     group->limits[resource] = limit;
     unlock(&group->lock);
+    return 0;
 }
 
 rlim_t_ rlimit(int resource) {
-    return rlimit_get(current, resource).cur;
+    struct rlimit_ limit;
+    if (rlimit_get(current, resource, &limit) != 0)
+        die("invalid resource %d", resource);
+    return limit.cur;
 }
 
-dword_t sys_getrlimit(dword_t resource, addr_t rlim_addr) {
-    struct rlimit_ rlimit = rlimit_get(current, resource);
-    STRACE("getrlimit(%d, {cur=%#x, max=%#x}", resource, rlimit.cur, rlimit.max);
+static int do_getrlimit32(int resource, struct rlimit32_ *rlimit32) {
+    STRACE("getlimit(%d)", resource);
+    struct rlimit_ rlimit;
+    int err = rlimit_get(current, resource, &rlimit);
+    if (err < 0)
+        return err;
+    STRACE(" {cur=%#x, max=%#x}", rlimit.cur, rlimit.max);
+
+    rlimit32->max = rlimit.max;
+    rlimit32->cur = rlimit.cur;
+    return 0;
+}
+
+dword_t sys_getrlimit32(dword_t resource, addr_t rlim_addr) {
+    struct rlimit32_ rlimit;
+    int err = do_getrlimit32(resource, &rlimit);
+    if (err < 0)
+        return err;
     if (user_put(rlim_addr, rlimit))
         return _EFAULT;
     return 0;
 }
 
-dword_t sys_setrlimit(dword_t resource, addr_t rlim_addr) {
-    struct rlimit_ rlimit;
-    if (user_get(rlim_addr, rlimit))
+dword_t sys_old_getrlimit32(dword_t resource, addr_t rlim_addr) {
+    struct rlimit32_ rlimit;
+    int err = do_getrlimit32(resource, &rlimit);
+    if (err < 0)
+        return err;
+
+    // This version of the call is for programs that aren't aware of rlim_t
+    // being 64 bit. RLIM_INFINITY looks like -1 when truncated to 32 bits.
+    if (rlimit.cur > INT_MAX)
+        rlimit.cur = INT_MAX;
+    if (rlimit.max > INT_MAX)
+        rlimit.max = INT_MAX;
+
+    if (user_put(rlim_addr, rlimit))
         return _EFAULT;
-    STRACE("setrlimit(%d, {cur=%#x, max=%#x}", resource, rlimit.cur, rlimit.max);
-    // TODO check permissions
-    rlimit_set(current, resource, rlimit);
     return 0;
 }
 
-dword_t sys_prlimit(pid_t_ pid, dword_t resource, addr_t new_limit_addr, addr_t old_limit_addr) {
+static int check_setrlimit(int resource, struct rlimit_ new_limit) {
+    if (superuser())
+        return 0;
+    struct rlimit_ old_limit;
+    int err = rlimit_get(current, resource, &old_limit);
+    if (err < 0)
+        return err;
+    if (new_limit.max > old_limit.max)
+        return _EPERM;
+    return 0;
+}
+
+dword_t sys_setrlimit32(dword_t resource, addr_t rlim_addr) {
+    struct rlimit_ rlimit;
+    if (user_get(rlim_addr, rlimit))
+        return _EFAULT;
+    STRACE("setrlimit(%d, {cur=%#x, max=%#x})", resource, rlimit.cur, rlimit.max);
+    int err = check_setrlimit(resource, rlimit);
+    if (err < 0)
+        return err;
+    return rlimit_set(current, resource, rlimit);
+}
+
+dword_t sys_prlimit64(pid_t_ pid, dword_t resource, addr_t new_limit_addr, addr_t old_limit_addr) {
+    STRACE("prlimit64(%d, %d)", pid, resource);
     if (pid != 0)
         return _EINVAL;
 
-    int err = 0;
     if (old_limit_addr != 0) {
-        err = sys_getrlimit(resource, old_limit_addr);
+        struct rlimit_ rlimit;
+        int err = rlimit_get(current, resource, &rlimit);
         if (err < 0)
             return err;
+        STRACE(" old={cur=%#x, max=%#x}", rlimit.cur, rlimit.max);
+        if (user_put(old_limit_addr, rlimit))
+            return _EFAULT;
     }
+
     if (new_limit_addr != 0) {
-        err = sys_setrlimit(resource, new_limit_addr);
+        struct rlimit_ rlimit;
+        if (user_get(new_limit_addr, rlimit))
+            return _EFAULT;
+        STRACE(" new={cur=%#x, max=%#x}", rlimit.cur, rlimit.max);
+        int err = check_setrlimit(resource, rlimit);
         if (err < 0)
             return err;
+        return rlimit_set(current, resource, rlimit);
     }
     return 0;
 }
@@ -121,7 +192,8 @@ dword_t sys_getrusage(dword_t who, addr_t rusage_addr) {
     return 0;
 }
 
-dword_t sys_sched_getaffinity(pid_t_ pid, dword_t cpusetsize, addr_t cpuset_addr) {
+int_t sys_sched_getaffinity(pid_t_ pid, dword_t cpusetsize, addr_t cpuset_addr) {
+    STRACE("sched_getaffinity(%d, %d, %#x)", pid, cpusetsize, cpuset_addr);
     if (pid != 0) {
         lock(&pids_lock);
         struct task *task = pid_get_task(pid);
@@ -134,12 +206,18 @@ dword_t sys_sched_getaffinity(pid_t_ pid, dword_t cpusetsize, addr_t cpuset_addr
     if (cpus > cpusetsize * 8)
         cpus = cpusetsize * 8;
     char cpuset[cpusetsize];
+    memset(cpuset, 0, sizeof(cpuset));
     for (unsigned i = 0; i < cpus; i++)
         bit_set(i, cpuset);
     if (user_write(cpuset_addr, cpuset, cpusetsize))
         return _EFAULT;
     return 0;
 }
+int_t sys_sched_setaffinity(pid_t_ UNUSED(pid), dword_t UNUSED(cpusetsize), addr_t UNUSED(cpuset_addr)) {
+    // meh
+    return 0;
+}
+
 int_t sys_getpriority(int_t which, pid_t_ who) {
     STRACE("getpriority(%d, %d)", which, who);
     return 20;
@@ -147,4 +225,33 @@ int_t sys_getpriority(int_t which, pid_t_ who) {
 int_t sys_setpriority(int_t which, pid_t_ who, int_t prio) {
     STRACE("setpriority(%d, %d, %d)", which, who, prio);
     return 0;
+}
+
+// realtime scheduling stubs
+int_t sys_sched_getparam(pid_t_ UNUSED(pid), addr_t param_addr) {
+    int_t sched_priority = 0;
+    if (user_put(param_addr, sched_priority))
+        return _EFAULT;
+    return 0;
+}
+#define SCHED_OTHER_ 0
+int_t sys_sched_getscheduler(pid_t_ UNUSED(pid)) {
+    return SCHED_OTHER_;
+}
+int_t sys_sched_setscheduler(pid_t_ UNUSED(pid), int_t policy, addr_t param_addr) {
+    if (policy != SCHED_OTHER_)
+        return _EINVAL;
+    int_t sched_priority;
+    if (user_get(param_addr, sched_priority))
+        return _EFAULT;
+    if (sched_priority != 0)
+        return _EINVAL;
+    return 0;
+}
+
+int_t sys_sched_get_priority_max(int_t policy) {
+    STRACE("sched_get_priority_max(%d)", policy);
+    if (policy == 0)
+        return 0;
+    return _EINVAL;
 }

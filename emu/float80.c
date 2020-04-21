@@ -50,6 +50,10 @@ static uint128_t u128_shift_right_round(uint128_t i, int shift, int sign) {
     uint64_t rest = i & ~(-1ul << (shift - 1));
 
     i >>= shift;
+    // if all the bits shifted out were zeroes, we're done
+    if (guard == 0 && rest == 0)
+        return i;
+
     switch (f80_rounding_mode) {
         case round_up:
             if (!sign)
@@ -61,12 +65,12 @@ static uint128_t u128_shift_right_round(uint128_t i, int shift, int sign) {
             break;
         case round_to_nearest:
             // if guard bit is not set, no need to round up
-            if (guard) {
-                if (rest != 0)
-                    i++; // round up
-                else if (i & 1)
-                    i++; // round to nearest even
-            }
+            if (!guard)
+                break;
+            if (rest != 0)
+                i++; // round up
+            else if (i & 1)
+                i++; // round to nearest even
             break;
     }
     return i;
@@ -224,7 +228,7 @@ float80 f80_from_double(double d) {
     else
         f.exp = bias((int) db.exp - 0x3ff);
 
-    f.signif = db.signif << 11;
+    f.signif = (uint64_t) db.signif << 11;
     if (db.exp != EXP64_DENORMAL)
         f.signif |= CURSED_BIT;
     f.sign = db.sign;

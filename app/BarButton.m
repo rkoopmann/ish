@@ -10,6 +10,8 @@
 @interface BarButton ()
 @end
 
+extern UIAccessibilityTraits UIAccessibilityTraitToggle;
+
 @implementation BarButton
 
 - (void)awakeFromNib {
@@ -21,6 +23,9 @@
     self.backgroundColor = self.defaultColor;
     self.keyAppearance = UIKeyboardAppearanceLight;
     self.accessibilityTraits |= UIAccessibilityTraitKeyboardKey;
+    if (self.toggleable) {
+        self.accessibilityTraits |= 0x20000000000000;
+    }
 }
 
 - (UIColor *)primaryColor {
@@ -50,13 +55,16 @@
     if (self.selected || self.highlighted) {
         self.backgroundColor = self.highlightedColor;
     } else {
-        self.backgroundColor = self.defaultColor;
+        [UIView animateWithDuration:0 delay:0.1 options:UIViewAnimationOptionAllowUserInteraction animations:^{
+            self.backgroundColor = self.defaultColor;
+        } completion:nil];
     }
     if (self.keyAppearance == UIKeyboardAppearanceLight) {
-        [self setTitleColor:UIColor.blackColor forState:UIControlStateNormal];
+        self.tintColor = UIColor.blackColor;
     } else {
-        [self setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        self.tintColor = UIColor.whiteColor;
     }
+    [self setTitleColor:self.tintColor forState:UIControlStateNormal];
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
@@ -71,6 +79,13 @@
 - (void)setKeyAppearance:(UIKeyboardAppearance)keyAppearance {
     _keyAppearance = keyAppearance;
     [self chooseBackground];
+}
+
+- (NSString *)accessibilityValue {
+    if (self.toggleable) {
+        return self.selected ? @"1" : @"0";
+    }
+    return nil;
 }
 
 @end

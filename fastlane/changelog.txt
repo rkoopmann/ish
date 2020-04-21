@@ -1,27 +1,21 @@
 New stuff:
-- pseudoterminals (in other words, you can now ssh into your phone)
-- 1337 h4x0r colorscheme
-- Command-K clears the screen
-- bit testing instructions implemented
+- Half-broken tmpfs implementation
+- Caps lock mapping is now gone on iOS 13, because 13.4 adds a system-wide option
+- Kerberos works
+- AltStore installation is officially supported
+- adb works for connecting to Android devices over the network (not USB)
+- Added a way to fix your iSH setup if you mess up the launch/boot commands
 
-Bug fixes:
-- DNS configuration not working for IPv6 servers
-- [invalid utf8]
-- Crash when attempting to use negative file descriptors
-- Various other memory leaks and segfaults
-
-Here's a quick step by step guide for running an ssh server.
-1. apk add openssh
-2. ssh-keygen -A
-3. passwd
-4. type a password
-5. /usr/sbin/sshd
-You should now be able to ssh to your device with username root and the password you typed.
-
-If you switch to another app and switch back, the ssh server will stop responding even though it's still running. Fixing this is actually really hard; help would be appreciated.
+Fixed bugs:
+- ceil(3) returning 4
+- R's nlm demo crashing
+- fish having some trouble changing process groups
+- git clone failing dramatically when your device only has one CPU
+- SO_ERROR codes not being translated
+- Java sockets failing with "not a tty"
 
 Send bug reports or feedback here: https://github.com/tbodt/ish/issues (or by email, if you prefer)
 Follow iSH on Twitter: https://twitter.com/iSH_app
 Join the Discord: https://discord.gg/SndDh5y
-Give me money: https://patreon.com/tbodt
+Give me money here: https://patreon.com/tbodt
 

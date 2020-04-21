@@ -11,7 +11,10 @@ fd_t sys_epoll_create(int_t flags) {
     struct fd *fd = adhoc_fd_create(&epoll_ops);
     if (fd == NULL)
         return _ENOMEM;
-    fd->poll = poll_create();
+    struct poll *poll = poll_create();
+    if (IS_ERR(poll))
+        return PTR_ERR(poll);
+    fd->epollfd.poll = poll;
     return f_install(fd, flags);
 }
 fd_t sys_epoll_create0() {
@@ -41,21 +44,26 @@ int_t sys_epoll_ctl(fd_t epoll_f, int_t op, fd_t f, addr_t event_addr) {
         return _EBADF;
 
     if (op == EPOLL_CTL_DEL_)
-        return poll_del_fd(epoll->poll, fd);
+        return poll_del_fd(epoll->epollfd.poll, fd);
 
     struct epoll_event_ event;
     if (user_get(event_addr, event))
         return _EFAULT;
     STRACE(" {events: %#x, data: %#x}", event.events, event.data);
-    if (event.events & (EPOLLET_|EPOLLONESHOT_))
-        return _EINVAL;
+    if (event.events & EPOLLET_) {
+        // The exact semantics of EPOLLET are hard to emulate on Darwin, so
+        // let's play it safe. Common patterns using EPOLLET will work fine
+        // without it, albiet inefficiently.
+        TRACE("ignoring EPOLLET\n");
+        event.events &= ~EPOLLET_;
+    }
 
     if (op == EPOLL_CTL_ADD_) {
-        if (poll_has_fd(epoll->poll, fd))
+        if (poll_has_fd(epoll->epollfd.poll, fd))
             return _EEXIST;
-        return poll_add_fd(epoll->poll, fd, event.events, (union poll_fd_info) event.data);
+        return poll_add_fd(epoll->epollfd.poll, fd, event.events, (union poll_fd_info) event.data);
     } else {
-        return poll_mod_fd(epoll->poll, fd, event.events, (union poll_fd_info) event.data);
+        return poll_mod_fd(epoll->epollfd.poll, fd, event.events, (union poll_fd_info) event.data);
     }
 }
 
@@ -83,7 +91,7 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
         return _EINVAL;
 
     struct timespec timeout_ts;
-    if (timeout != -1) {
+    if (timeout >= 0) {
         timeout_ts.tv_sec = timeout / 1000;
         timeout_ts.tv_nsec = (timeout % 1000) * 1000000;
     }
@@ -92,7 +100,9 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
     struct epoll_event_ events[max_events];
 
     struct epoll_context context = {.events = events, .n = 0, .max_events = max_events};
-    int res = poll_wait(epoll->poll, epoll_callback, &context, timeout == -1 ? NULL : &timeout_ts);
+    STRACE("...\n");
+    int res = poll_wait(epoll->epollfd.poll, epoll_callback, &context, timeout < 0 ? NULL : &timeout_ts);
+    STRACE("%d end epoll_wait", current->pid);
     if (res >= 0)
         if (user_write(events_addr, events, sizeof(struct epoll_event_) * res))
             return _EFAULT;
@@ -100,24 +110,20 @@ int_t sys_epoll_wait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t t
 }
 
 int_t sys_epoll_pwait(fd_t epoll_f, addr_t events_addr, int_t max_events, int_t timeout, addr_t sigmask_addr, dword_t sigsetsize) {
-    sigset_t_ mask, old_mask;
+    sigset_t_ mask;
     if (sigmask_addr != 0) {
         if (sigsetsize != sizeof(sigset_t_))
             return _EINVAL;
         if (user_get(sigmask_addr, mask))
             return _EFAULT;
-        do_sigprocmask(SIG_SETMASK_, mask, &old_mask);
+        sigmask_set_temp(mask);
     }
 
-    int_t res = sys_epoll_wait(epoll_f, events_addr, max_events, timeout);
-
-    if (sigmask_addr != 0)
-        do_sigprocmask(SIG_SETMASK_, old_mask, NULL);
-    return res;
+    return sys_epoll_wait(epoll_f, events_addr, max_events, timeout);
 }
 
 static int epoll_close(struct fd *fd) {
-    poll_destroy(fd->poll);
+    poll_destroy(fd->epollfd.poll);
     return 0;
 }
 

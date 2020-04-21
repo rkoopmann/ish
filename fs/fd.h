@@ -27,42 +27,78 @@ struct fd {
             struct tty *tty;
             // links together fds pointing to the same tty
             // locked by the tty
-            struct list other_fds;
+            struct list tty_other_fds;
         };
-        // epoll
         struct {
             struct poll *poll;
-        };
-        // eventfd
+        } epollfd;
         struct {
-            uint64_t eventfd_val;
-        };
-        // timerfd
+            uint64_t val;
+        } eventfd;
         struct {
             struct timer *timer;
             uint64_t expirations;
-        };
+        } timerfd;
+        struct {
+            int domain;
+            int type;
+            int protocol;
+
+            // These are only used as strong references, to keep the inode
+            // alive while there is a listener.
+            struct inode_data *unix_name_inode;
+            struct unix_abstract *unix_name_abstract;
+            // TODO add a field for unix socket name
+            struct fd *unix_peer; // locked by peer_lock, for simplicity
+            cond_t unix_got_peer;
+            // Queue of struct scm for sending file descriptors
+            // locked by fd->lock
+            struct list unix_scm;
+            struct ucred_ {
+                pid_t_ pid;
+                uid_t_ uid;
+                uid_t_ gid;
+            } unix_cred;
+        } socket;
+
+        // See app/Pasteboard.m
+        struct {
+            // UIPasteboard.changeCount
+            uint64_t generation;
+            // Buffer for written data
+            void* buffer;
+            // its capacity
+            size_t buffer_cap;
+            // length of actual data stored in the buffer
+            size_t buffer_len;
+        } clipboard;
+
+        // can fit anything in here
+        void *data;
     };
     // fs data
     union {
-        // proc
         struct {
-            struct proc_entry proc_entry;
-            unsigned proc_dir_index;
-            char *proc_data;
-            size_t proc_size;
-        };
-        // devpts
+            struct proc_entry entry;
+            unsigned dir_index;
+            struct proc_data data;
+        } proc;
         struct {
-            int pty_num;
-        };
+            int num;
+        } devpts;
+        struct {
+            struct tmp_dirent *dirent;
+            struct tmp_dirent *dir_pos;
+        } tmpfs;
+        void *fs_data;
     };
 
     // fs/inode data
     struct mount *mount;
-    int real_fd; // seeks on this fd require the lock
-    int fake_inode;
+    int real_fd; // seeks on this fd require the lock TODO think about making a special lock just for that
     DIR *dir;
+    struct inode_data *inode;
+    ino_t fake_inode;
     struct statbuf stat; // for adhoc fs
     struct fd_sockrestart sockrestart; // argh
 
@@ -96,6 +132,8 @@ struct fd_ops {
     // TODO make optional for non-files
     ssize_t (*read)(struct fd *fd, void *buf, size_t bufsize);
     ssize_t (*write)(struct fd *fd, const void *buf, size_t bufsize);
+    ssize_t (*pread)(struct fd *fd, void *buf, size_t bufsize, off_t off);
+    ssize_t (*pwrite)(struct fd *fd, const void *buf, size_t bufsize, off_t off);
     off_t_ (*lseek)(struct fd *fd, off_t_ off, int whence);
 
     // Reads a directory entry from the stream
@@ -131,7 +169,7 @@ struct fd_ops {
 
 struct fdtable {
     atomic_uint refcount;
-    int size;
+    unsigned size;
     struct fd **files;
     bits_t *cloexec;
     lock_t lock;

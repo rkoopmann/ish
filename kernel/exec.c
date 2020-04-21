@@ -15,12 +15,21 @@
 #include "kernel/elf.h"
 #include "kernel/vdso.h"
 
+#define ARGV_MAX 32 * PAGE_SIZE
+
+struct exec_args {
+    // number of arguments
+    size_t count;
+    // series of count null-terminated strings, plus an extra null for good measure
+    const char *args;
+};
+
 static inline dword_t align_stack(dword_t sp);
 static inline ssize_t user_strlen(dword_t p);
 static inline int user_memset(addr_t start, byte_t val, dword_t len);
 static inline dword_t copy_string(dword_t sp, const char *string);
-static inline dword_t copy_strings(dword_t sp, char *const strings[]);
-static unsigned count_args(char *const args[]);
+static inline dword_t args_copy(dword_t sp, struct exec_args args);
+static size_t args_size(struct exec_args args);
 
 static int read_header(struct fd *fd, struct elf_header *header) {
     int err;
@@ -77,6 +86,9 @@ static int load_entry(struct prg_header ph, addr_t bias, struct fd *fd) {
                     PAGE_ROUND_UP(filesize + PGOFFSET(addr)),
                     offset - PGOFFSET(addr), flags, MMAP_PRIVATE)) < 0)
         return err;
+    // TODO find a better place for these to avoid code duplication
+    mem_pt(current->mem, PAGE(addr))->data->fd = fd_retain(fd);
+    mem_pt(current->mem, PAGE(addr))->data->file_offset = offset - PGOFFSET(addr);
 
     if (memsize > filesize) {
         // put zeroes between addr + filesize and addr + memsize, call that bss
@@ -90,8 +102,13 @@ static int load_entry(struct prg_header ph, addr_t bias, struct fd *fd) {
             // if you can calculate tail_size better and not have to do this please let me know
             tail_size = 0;
 
-        if (tail_size != 0)
+        if (tail_size != 0) {
+            // Unlock and lock the mem because the user functions must be
+            // called without locking mem.
+            write_wrunlock(&current->mem->lock);
             user_memset(file_end, 0, tail_size);
+            write_wrlock(&current->mem->lock);
+        }
         if (tail_size > bss_size)
             tail_size = bss_size;
 
@@ -104,7 +121,25 @@ static int load_entry(struct prg_header ph, addr_t bias, struct fd *fd) {
     return 0;
 }
 
-static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *const envp[]) {
+static addr_t find_hole_for_elf(struct elf_header *header, struct prg_header *ph) {
+    struct prg_header *first = NULL, *last = NULL;
+    for (int i = 0; i < header->phent_count; i++) {
+        if (ph[i].type == PT_LOAD) {
+            if (first == NULL)
+                first = &ph[i];
+            last = &ph[i];
+        }
+    }
+    pages_t size = 0;
+    if (first != NULL) {
+        pages_t a = PAGE_ROUND_UP(last->vaddr + last->memsize);
+        pages_t b = PAGE(first->vaddr);
+        size = a - b;
+    }
+    return pt_find_hole(current->mem, size) << PAGE_BITS;
+}
+
+static int elf_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     int err = 0;
 
     // read the headers
@@ -162,8 +197,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     // killed before it even starts. please don't be too sad about it, it's
     // just a process.
     mm_release(current->mm);
-    current->mm = mm_new();
-    current->mem = current->cpu.mem = &current->mm->mem;
+    task_set_mm(current, mm_new());
     write_wrlock(&current->mem->lock);
 
     current->mm->exefile = fd_retain(fd);
@@ -177,8 +211,13 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
         if (ph[i].type != PT_LOAD)
             continue;
 
-        if (!load_addr_set && header.type == ELF_DYNAMIC)
-            bias = 0x56555000; // I've no idea why
+        if (!load_addr_set && header.type == ELF_DYNAMIC) {
+            // see giant comment in linux/fs/binfmt_elf.c, around line 950
+            if (interp_name)
+                bias = 0x56555000; // I have no idea how this number was arrived at
+            else
+                bias = find_hole_for_elf(&header, ph);
+        }
 
         if ((err = load_entry(ph[i], bias, fd)) < 0)
             goto beyond_hope;
@@ -196,53 +235,44 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     }
 
     addr_t entry = bias + header.entry_point;
-    addr_t interp_addr = 0;
+    addr_t interp_base = 0;
 
     if (interp_name) {
         // map dat shit! interpreter edition
-        // but first, a brief intermission to find out just how big the interpreter is
-        struct prg_header *interp_first = NULL, *interp_last = NULL;
-        for (int i = 0; i < interp_header.phent_count; i++) {
-            if (interp_ph[i].type == PT_LOAD) {
-                if (interp_first == NULL)
-                    interp_first = &interp_ph[i];
-                interp_last = &interp_ph[i];
-            }
-        }
-        pages_t interp_size = 0;
-        if (interp_first != NULL) {
-            pages_t a = PAGE_ROUND_UP(interp_last->vaddr + interp_last->memsize);
-            pages_t b = PAGE(interp_first->vaddr);
-            interp_size = a - b;
-        }
-        interp_addr = pt_find_hole(current->mem, interp_size) << PAGE_BITS;
-        // now back to map dat shit! interpreter edition
+        interp_base = find_hole_for_elf(&interp_header, interp_ph);
         for (int i = interp_header.phent_count - 1; i >= 0; i--) {
             if (interp_ph[i].type != PT_LOAD)
                 continue;
-            if ((err = load_entry(interp_ph[i], interp_addr, interp_fd)) < 0)
+            if ((err = load_entry(interp_ph[i], interp_base, interp_fd)) < 0)
                 goto beyond_hope;
         }
-        entry = interp_addr + interp_header.entry_point;
+        entry = interp_base + interp_header.entry_point;
     }
 
     // map vdso
     err = _ENOMEM;
     pages_t vdso_pages = sizeof(vdso_data) >> PAGE_BITS;
-    page_t vdso_page = pt_find_hole(current->mem, vdso_pages);
+    // FIXME disgusting hack: musl's dynamic linker has a one-page hole, and
+    // I'd rather not put the vdso in that hole. so find a two-page hole and
+    // add one.
+    page_t vdso_page = pt_find_hole(current->mem, vdso_pages + 1);
     if (vdso_page == BAD_PAGE)
         goto beyond_hope;
-    if ((err = pt_map(current->mem, vdso_page, vdso_pages, (void *) vdso_data, 0)) < 0)
+    vdso_page += 1;
+    if ((err = pt_map(current->mem, vdso_page, vdso_pages, (void *) vdso_data, 0, 0)) < 0)
         goto beyond_hope;
+    mem_pt(current->mem, vdso_page)->data->name = "[vdso]";
     current->mm->vdso = vdso_page << PAGE_BITS;
     addr_t vdso_entry = current->mm->vdso + ((struct elf_header *) vdso_data)->entry_point;
 
     // map 3 empty "vvar" pages to satisfy ptraceomatic
-    page_t vvar_page = pt_find_hole(current->mem, 3);
+#define NUM_VVAR 3
+    page_t vvar_page = pt_find_hole(current->mem, NUM_VVAR);
     if (vvar_page == BAD_PAGE)
         goto beyond_hope;
-    if ((err = pt_map_nothing(current->mem, vvar_page, 3, 0)) < 0)
+    if ((err = pt_map_nothing(current->mem, vvar_page, NUM_VVAR, 0)) < 0)
         goto beyond_hope;
+    mem_pt(current->mem, vvar_page)->data->name = "[vvar]";
 
     // STACK TIME!
 
@@ -262,11 +292,11 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     addr_t file_addr = sp = copy_string(sp, file);
     if (sp == 0)
         goto beyond_hope;
-    addr_t envp_addr = sp = copy_strings(sp, envp);
+    addr_t envp_addr = sp = args_copy(sp, envp);
     if (sp == 0)
         goto beyond_hope;
     current->mm->argv_end = sp;
-    addr_t argv_addr = sp = copy_strings(sp, argv);
+    addr_t argv_addr = sp = args_copy(sp, argv);
     if (sp == 0)
         goto beyond_hope;
     current->mm->argv_start = sp;
@@ -296,7 +326,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
         {AX_PHDR, load_addr + header.prghead_off},
         {AX_PHENT, sizeof(struct prg_header)},
         {AX_PHNUM, header.phent_count},
-        {AX_BASE, interp_addr},
+        {AX_BASE, interp_base},
         {AX_FLAGS, 0},
         {AX_ENTRY, bias + header.entry_point},
         {AX_UID, 0},
@@ -310,9 +340,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
         {AX_PLATFORM, platform_addr},
         {0, 0}
     };
-    dword_t argc = count_args(argv);
-    dword_t envc = count_args(envp);
-    sp -= ((argc + 1) + (envc + 1) + 1) * sizeof(dword_t);
+    sp -= ((argv.count + 1) + (envp.count + 1) + 1) * sizeof(dword_t);
     sp -= sizeof(aux);
     sp &=~ 0xf;
 
@@ -320,11 +348,12 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     addr_t p = sp;
 
     // argc
-    if (user_put(p, argc))
+    if (user_put(p, argv.count))
         return _EFAULT;
     p += sizeof(dword_t);
 
     // argv
+    size_t argc = argv.count;
     while (argc-- > 0) {
         if (user_put(p, argv_addr))
             return _EFAULT;
@@ -334,6 +363,7 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
     p += sizeof(dword_t); // null terminator
 
     // envp
+    size_t envc = envp.count;
     while (envc-- > 0) {
         if (user_put(p, envp_addr))
             return _EFAULT;
@@ -347,10 +377,24 @@ static int elf_exec(struct fd *fd, const char *file, char *const argv[], char *c
         goto beyond_hope;
     p += sizeof(aux);
 
+    current->mm->stack_start = sp;
     current->cpu.esp = sp;
     current->cpu.eip = entry;
     current->cpu.fcw = 0x37f;
+
+    // This code was written when I discovered that the glibc entry point
+    // interprets edx as the address of a function to call on exit, as
+    // specified in the ABI. This register is normally set by the dynamic
+    // linker, so everything works fine until you run a static executable.
+    current->cpu.eax = 0;
+    current->cpu.ebx = 0;
+    current->cpu.ecx = 0;
+    current->cpu.edx = 0;
+    current->cpu.esi = 0;
+    current->cpu.edi = 0;
+    current->cpu.ebp = 0;
     collapse_flags(&current->cpu);
+    current->cpu.eflags = 0;
 
     err = 0;
 out_free_interp:
@@ -370,11 +414,15 @@ beyond_hope:
     goto out_free_interp;
 }
 
-static unsigned count_args(char *const args[]) {
-    unsigned i;
-    for (i = 0; args[i] != NULL; i++)
-        ;
-    return i;
+static size_t args_size(struct exec_args args) {
+    const char *args_end = args.args;
+    for (size_t i = 0; i < args.count; i++) {
+        args_end += strlen(args_end) + 1;
+    }
+    // don't forget the very last null terminator
+    assert(args_end[0] == '\0');
+    args_end++;
+    return args_end - args.args;
 }
 
 static inline dword_t align_stack(addr_t sp) {
@@ -388,12 +436,11 @@ static inline dword_t copy_string(addr_t sp, const char *string) {
     return sp;
 }
 
-static inline dword_t copy_strings(addr_t sp, char *const strings[]) {
-    for (unsigned i = count_args(strings); i > 0; i--) {
-        sp = copy_string(sp, strings[i - 1]);
-        if (sp == 0)
-            return 0;
-    }
+static inline dword_t args_copy(addr_t sp, struct exec_args args) {
+    size_t size = args_size(args);
+    sp -= size;
+    if (user_write(sp, args.args, size))
+        return 0;
     return sp;
 }
 
@@ -415,7 +462,7 @@ static inline int user_memset(addr_t start, byte_t val, dword_t len) {
     return 0;
 }
 
-static int format_exec(struct fd *fd, const char *file, char *const argv[], char *const envp[]) {
+static int format_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     int err = elf_exec(fd, file, argv, envp);
     if (err != _ENOEXEC)
         return err;
@@ -423,7 +470,7 @@ static int format_exec(struct fd *fd, const char *file, char *const argv[], char
     return _ENOEXEC;
 }
 
-static int shebang_exec(struct fd *fd, const char *file, char *const argv[], char *const envp[]) {
+static int shebang_exec(struct fd *fd, const char *file, struct exec_args argv, struct exec_args envp) {
     // read the first 128 bytes to get the shebang line out of
     if (fd->ops->lseek(fd, 0, SEEK_SET))
         return _EIO;
@@ -466,25 +513,43 @@ static int shebang_exec(struct fd *fd, const char *file, char *const argv[], cha
     if (*argument == '\0')
         argument = NULL;
 
-    int args_extra = 2;
+    struct exec_args argv_rest = {
+        .count = argv.count - 1,
+        .args = argv.args + strlen(argv.args) + 1,
+    };
+    size_t args_rest_size = args_size(argv_rest);
+    size_t extra_args_size = strlen(interpreter) + 1 + strlen(file) + 1;
     if (argument)
-        args_extra++;
-    char *real_argv[count_args(argv) + args_extra];
-    real_argv[0] = interpreter;
-    if (argument)
-        real_argv[1] = argument;
-    real_argv[args_extra - 1] = (char *) file; // maybe you'll have better luck getting rid of this cast
-    memcpy(real_argv + args_extra, argv + 1, (count_args(argv)) * sizeof(argv[0]));
+        extra_args_size += strlen(argument) + 1;
+    if (args_rest_size + extra_args_size >= ARGV_MAX)
+        return _E2BIG;
+
+    char new_argv_buf[ARGV_MAX];
+    struct exec_args new_argv = {.args = new_argv_buf};
+    size_t n = 0;
+    strcpy(new_argv_buf, interpreter);
+    new_argv.count++;
+    n += strlen(interpreter) + 1;
+    if (argument) {
+        strcpy(new_argv_buf + n, argument);
+        new_argv.count++;
+        n += strlen(argument) + 1;
+    }
+    strcpy(new_argv_buf + n, file);
+    n += strlen(file) + 1;
+    new_argv.count++;
+    memcpy(new_argv_buf + n, argv_rest.args, args_rest_size);
+    new_argv.count += argv_rest.count;
 
     struct fd *interpreter_fd = generic_open(interpreter, O_RDONLY_, 0);
     if (IS_ERR(interpreter_fd))
         return PTR_ERR(interpreter_fd);
-    int err = format_exec(interpreter_fd, interpreter, real_argv, envp);
+    int err = format_exec(interpreter_fd, interpreter, new_argv, envp);
     fd_close(interpreter_fd);
     return err;
 }
 
-int sys_execve(const char *file, char *const argv[], char *const envp[]) {
+int __do_execve(const char *file, struct exec_args argv, struct exec_args envp) {
     struct fd *fd = generic_open(file, O_RDONLY, 0);
     if (IS_ERR(fd))
         return PTR_ERR(fd);
@@ -558,49 +623,85 @@ int sys_execve(const char *file, char *const argv[], char *const envp[]) {
     return 0;
 }
 
-#define MAX_ARGS 256 // for now
-dword_t _sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
-    // TODO this code is shit, fix it
+int do_execve(const char *file, size_t argc, const char *argv_p, const char *envp_p) {
+    struct exec_args argv = {.count = argc, .args = argv_p};
+    struct exec_args envp = {.args = envp_p};
+    while (*envp_p != '\0') {
+        envp_p += strlen(envp_p) + 1;
+        envp.count++;
+    }
+    return __do_execve(file, argv, envp);
+}
+
+static ssize_t user_read_string_array(addr_t addr, char *buf, size_t max) {
+    size_t i = 0;
+    size_t p = 0;
+    for (;;) {
+        addr_t str_addr;
+        if (user_get(addr + i * sizeof(addr_t), str_addr))
+            return _EFAULT;
+        if (str_addr == 0)
+            break;
+        size_t str_p = 0;
+        for (;;) {
+            if (p >= max)
+                return _E2BIG;
+            if (user_get(str_addr + str_p, buf[p]))
+                return _EFAULT;
+            str_p++;
+            p++;
+            if (buf[p - 1] == '\0')
+                break;
+        }
+        i++;
+    }
+    if (p >= max)
+        return _E2BIG;
+    buf[p] = '\0';
+    return i;
+}
+
+dword_t sys_execve(addr_t filename_addr, addr_t argv_addr, addr_t envp_addr) {
     char filename[MAX_PATH];
     if (user_read_string(filename_addr, filename, sizeof(filename)))
         return _EFAULT;
-    char *argv[MAX_ARGS];
-    int i;
-    addr_t arg;
+
+    int err = _ENOMEM;
+    char *argv = malloc(ARGV_MAX);
+    if (argv == NULL)
+        goto err_free_argv;
+    ssize_t argc = user_read_string_array(argv_addr, argv, ARGV_MAX);
+    if (argc < 0) {
+        err = argc;
+        goto err_free_argv;
+    }
+
+    char *envp = malloc(ARGV_MAX);
+    if (envp == NULL)
+        goto err_free_envp;
+    err = user_read_string_array(envp_addr, envp, ARGV_MAX);
+    if (err < 0)
+        goto err_free_envp;
+
     STRACE("execve(\"%s\", {", filename);
-    for (i = 0; ; i++) {
-        if (user_get(argv_addr + i * 4, arg))
-            return _EFAULT;
-        if (arg == 0)
-            break;
-        if (i >= MAX_ARGS)
-            return _E2BIG;
-        argv[i] = malloc(MAX_PATH);
-        if (user_read_string(arg, argv[i], MAX_PATH))
-            return _EFAULT;
-        STRACE("\"%.100s\", ", argv[i]);
+    const char *args = argv;
+    while (*args != '\0') {
+        STRACE("\"%s\", ", args);
+        args += strlen(args) + 1;
     }
-    argv[i] = NULL;
-    char *envp[MAX_ARGS];
     STRACE("}, {");
-    for (i = 0; ; i++) {
-        if (user_get(envp_addr + i * 4, arg))
-            return _EFAULT;
-        if (arg == 0)
-            break;
-        if (i >= MAX_ARGS)
-            return _E2BIG;
-        envp[i] = malloc(MAX_PATH);
-        if (user_read_string(arg, envp[i], MAX_PATH))
-            return _EFAULT;
-        STRACE("\"%.100s\", ", envp[i]);
+    args = envp;
+    while (*args != '\0') {
+        STRACE("\"%s\", ", args);
+        args += strlen(args) + 1;
     }
-    envp[i] = NULL;
     STRACE("})");
-    int res = sys_execve(filename, argv, envp);
-    for (i = 0; argv[i] != NULL; i++)
-        free(argv[i]);
-    for (i = 0; envp[i] != NULL; i++)
-        free(envp[i]);
-    return res;
+
+    return do_execve(filename, argc, argv, envp);
+
+err_free_envp:
+    free(envp);
+err_free_argv:
+    free(argv);
+    return err;
 }

@@ -2,25 +2,35 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <ctype.h>
+#include "kernel/task.h"
 #include "kernel/errno.h"
 #include "fs/tty.h"
+#include "fs/devices.h"
 
 extern struct tty_driver pty_slave;
 
 // the master holds a reference to the slave, so the slave will always be cleaned up second
 // when the master cleans up it hangs up the slave, making any operation that references the master unreachable
 
+static void pty_slave_init_inode(struct tty *tty) {
+    tty->pty.uid = current->euid;
+    // TODO make these mount options
+    tty->pty.gid = current->egid;
+    tty->pty.perms = 0620;
+}
+
 static int pty_master_init(struct tty *tty) {
     tty->termios.iflags = 0;
     tty->termios.oflags = 0;
     tty->termios.lflags = 0;
 
-    struct tty *slave = tty_alloc(&pty_slave, tty->num);
+    struct tty *slave = tty_alloc(&pty_slave, TTY_PSEUDO_SLAVE_MAJOR, tty->num);
     slave->refcount = 1;
     pty_slave.ttys[tty->num] = slave;
     tty->pty.other = slave;
     slave->pty.other = tty;
     slave->pty.locked = true;
+    pty_slave_init_inode(slave);
     return 0;
 }
 
@@ -50,6 +60,12 @@ static int pty_master_ioctl(struct tty *tty, int cmd, void *arg) {
         case TIOCGPTN_:
             *(dword_t *) arg = slave->num;
             break;
+        case TIOCPKT_:
+            tty->pty.packet_mode = !!*(dword_t *) arg;
+            break;
+        case TIOCGPKT_:
+            *(dword_t *) arg = tty->pty.packet_mode;
+            break;
         default:
             return _ENOTTY;
     }
@@ -73,35 +89,50 @@ const struct tty_driver_ops pty_master_ops = {
     .ioctl = pty_master_ioctl,
     .cleanup = pty_master_cleanup,
 };
-DEFINE_TTY_DRIVER(pty_master, &pty_master_ops, MAX_PTYS);
+DEFINE_TTY_DRIVER(pty_master, &pty_master_ops, TTY_PSEUDO_MASTER_MAJOR, MAX_PTYS);
 
 const struct tty_driver_ops pty_slave_ops = {
     .init = pty_return_eio,
     .open = pty_slave_open,
     .write = pty_write,
 };
-DEFINE_TTY_DRIVER(pty_slave, &pty_slave_ops, MAX_PTYS);
+DEFINE_TTY_DRIVER(pty_slave, &pty_slave_ops, TTY_PSEUDO_SLAVE_MAJOR, MAX_PTYS);
 
-int ptmx_open(struct fd *fd) {
+static int pty_reserve_next() {
     int pty_num;
     lock(&ttys_lock);
     for (pty_num = 0; pty_num < MAX_PTYS; pty_num++) {
         if (pty_slave.ttys[pty_num] == NULL)
             break;
     }
+    pty_slave.ttys[pty_num] = (void *) 1; // anything non-null to reserve it
     unlock(&ttys_lock);
+    return pty_num;
+}
+
+int ptmx_open(struct fd *fd) {
+    int pty_num = pty_reserve_next();
     if (pty_num == MAX_PTYS)
         return _ENOSPC;
+    struct tty *master = tty_get(&pty_master, TTY_PSEUDO_MASTER_MAJOR, pty_num);
+    if (IS_ERR(master))
+        return PTR_ERR(master);
+    return tty_open(master, fd);
+}
 
-    struct tty *tty = tty_get(&pty_master, pty_num);
+struct tty *pty_open_fake(struct tty_driver *driver) {
+    int pty_num = pty_reserve_next();
+    if (pty_num == MAX_PTYS)
+        return ERR_PTR(_ENOSPC);
+    // TODO this is a bit of a hack
+    driver->ttys = pty_slave.ttys;
+    driver->limit = pty_slave.limit;
+    driver->major = TTY_PSEUDO_SLAVE_MAJOR;
+    struct tty *tty = tty_get(driver, TTY_PSEUDO_SLAVE_MAJOR, pty_num);
     if (IS_ERR(tty))
-        return PTR_ERR(tty);
-
-    fd->tty = tty;
-    lock(&tty->fds_lock);
-    list_add(&tty->fds, &fd->other_fds);
-    unlock(&tty->fds_lock);
-    return 0;
+        return tty;
+    pty_slave_init_inode(tty);
+    return tty;
 }
 
 static bool isdigits(const char *str) {
@@ -149,15 +180,15 @@ static struct fd *devpts_open(struct mount *UNUSED(mount), const char *path, int
     if (pty_num == _ENOENT)
         return ERR_PTR(_ENOENT);
     struct fd *fd = fd_create(&devpts_fdops);
-    fd->pty_num = pty_num;
+    fd->devpts.num = pty_num;
     return fd;
 }
 
 static int devpts_getpath(struct fd *fd, char *buf) {
-    if (fd->pty_num == -1)
+    if (fd->devpts.num == -1)
         strcpy(buf, "");
     else
-        sprintf(buf, "/%d", fd->pty_num);
+        sprintf(buf, "/%d", fd->devpts.num);
     return 0;
 }
 
@@ -212,11 +243,11 @@ static int devpts_setattr_num(int pty_num, struct attr attr) {
 }
 
 static int devpts_fstat(struct fd *fd, struct statbuf *stat) {
-    devpts_stat_num(fd->pty_num, stat);
+    devpts_stat_num(fd->devpts.num, stat);
     return 0;
 }
 
-static int devpts_stat(struct mount *UNUSED(mount), const char *path, struct statbuf *stat, bool UNUSED(follow_links)) {
+static int devpts_stat(struct mount *UNUSED(mount), const char *path, struct statbuf *stat) {
     int pty_num = devpts_get_pty_num(path);
     if (pty_num == _ENOENT)
         return _ENOENT;
@@ -233,12 +264,12 @@ static int devpts_setattr(struct mount *UNUSED(mount), const char *path, struct 
 }
 
 static int devpts_fsetattr(struct fd *fd, struct attr attr) {
-    devpts_setattr_num(fd->pty_num, attr);
+    devpts_setattr_num(fd->devpts.num, attr);
     return 0;
 }
 
 static int devpts_readdir(struct fd *fd, struct dir_entry *entry) {
-    assert(fd->pty_num == -1); // there shouldn't be anything to list but the root
+    assert(fd->devpts.num == -1); // there shouldn't be anything to list but the root
 
     int pty_num = fd->offset;
     while (pty_num < MAX_PTYS && !devpts_pty_exists(pty_num))
