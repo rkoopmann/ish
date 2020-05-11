@@ -107,31 +107,7 @@ restart:
                            READMODRM; VXOR(xmm_modrm_val, xmm_modrm_reg,128);
                            break;
 
-                case 0x6e: TRACEI("movd modrm, xmm");
-                           // TODO: REX.W = 1 might be needed later
-                           READMODRM; VZLOAD(modrm_val, xmm_modrm_reg,32);
-                           break;
-
-                case 0x6f: TRACEI("movdqa xmm:modrm, xmm");
-                           READMODRM; VLOAD(xmm_modrm_val, xmm_modrm_reg,128); break;
-
-                case 0x73: READMODRM;
-                           switch (modrm.opcode) {
-                               case 0x02: TRACEI("psrlq xmm imm");
-                                          READIMM8; VSHIFTR_IMM(xmm_modrm_val, imm,64); break;
-                               default: UNDEFINED;
-                           }
-                           break;
-
                 case 0x77: TRACEI("emms (ignored because there is no mmx)"); break;
-
-                case 0x7e: TRACEI("movd xmm, modrm");
-                           // TODO: REX.W = 1 might be needed later
-                           READMODRM; VSTORE(xmm_modrm_reg, xmm_modrm_val,32);
-                           break;
-
-                case 0x7f: TRACEI("movdqa xmm, xmm:modrm");
-                           READMODRM; VSTORE(xmm_modrm_reg, xmm_modrm_val,128); break;
 
                 case 0x80: TRACEI("jo rel\t");
                            READIMM; J_REL(O, imm); break;
@@ -290,9 +266,35 @@ restart:
 #endif
 
 #if OP_SIZE == 16
-                case 0xef: TRACEI("pxor xmm:modrm xmm");
-                           READMODRM; VXOR(xmm_modrm_val, xmm_modrm_reg,128);
+                case 0x6e: TRACEI("movd modrm, xmm");
+                           // TODO: REX.W = 1 might be needed later
+                           READMODRM; VZLOAD(xmm_modrm_val, xmm_modrm_reg,32); break;
+
+                case 0x6f: TRACEI("movdqa xmm:modrm, xmm");
+                           READMODRM; VLOAD(xmm_modrm_val, xmm_modrm_reg,128); break;
+
+                case 0x73: READMODRM;
+                           switch (modrm.opcode) {
+                               case 0x02: TRACEI("psrlq imm, xmm");
+                                          READIMM8; VSHIFTR_IMM(imm, xmm_modrm_reg,64); break;
+                               default: UNDEFINED;
+                           }
                            break;
+
+                case 0x7e: TRACEI("movd xmm, modrm");
+                           // TODO: REX.W = 1 might be needed later
+                           READMODRM; VSTORE(xmm_modrm_reg, xmm_modrm_val,32); break;
+
+                case 0x7f: TRACEI("movdqa xmm, xmm:modrm");
+                           READMODRM; VSTORE(xmm_modrm_reg, xmm_modrm_val,128); break;
+
+                case 0xef: TRACEI("pxor xmm:modrm xmm");
+                           READMODRM; VXOR(xmm_modrm_val, xmm_modrm_reg,128); break;
+#else
+                case 0x6f: TRACEI("movq modrm, mm");
+                           READMODRM; VLOAD(mm_modrm_val, mm_modrm_reg, 64); break;
+                case 0x7f: TRACEI("movq mm, modrm");
+                           READMODRM; VSTORE(mm_modrm_reg, mm_modrm_val, 64); break;
 #endif
 
                 default: TRACEI("undefined");
@@ -723,6 +725,7 @@ restart:
                     case 0xd960: TRACE("f2xm1"); F2XM1(); break;
                     case 0xd961: TRACE("fyl2x"); FYL2X(); break;
                     case 0xd963: TRACE("fpatan"); FPATAN(); break;
+                    case 0xd964: TRACE("fxtract"); FXTRACT(); break;
                     case 0xd967: TRACE("fincstp"); FINCSTP(); break;
                     case 0xd970: TRACE("fprem"); FPREM(); break;
                     case 0xd972: TRACE("fsqrt"); FSQRT(); break;
@@ -857,8 +860,6 @@ restart:
                 case 0xff: TRACEI("lock grp5 modrm\t");
                            READMODRM_MEM; GRP5_ATOMIC(modrm_val,oz); break;
 
-#undef GRP5_ATOMIC
-
                 default: TRACE("undefined"); UNDEFINED;
             }
             break;
@@ -870,11 +871,16 @@ restart:
                     READINSN;
                     switch (insn) {
                         case 0x10: TRACEI("movsd xmm:modrm, xmm");
-                                   READMODRM; VLOAD_PADMEM(xmm_modrm_val, xmm_modrm_reg,64);
-                                   break;
+                                   READMODRM; VLOAD_PADMEM(xmm_modrm_val, xmm_modrm_reg,64); break;
                         case 0x11: TRACEI("movsd xmm, xmm:modrm");
-                                   READMODRM; VSTORE(xmm_modrm_reg, xmm_modrm_val,64);
-                                   break;
+                                   READMODRM; VSTORE(xmm_modrm_reg, xmm_modrm_val,64); break;
+
+                        case 0x58: TRACEI("addsd xmm:modrm, xmm");
+                                   READMODRM; VS_FMATH(add, xmm_modrm_val, xmm_modrm_reg,64); break;
+                        case 0x59: TRACEI("mulsd xmm:modrm, xmm");
+                                   READMODRM; VS_FMATH(mul, xmm_modrm_val, xmm_modrm_reg,64); break;
+                        case 0x5c: TRACEI("subsd xmm:modrm, xmm");
+                                   READMODRM; VS_FMATH(sub, xmm_modrm_val, xmm_modrm_reg,64); break;
 
                         case 0x18 ... 0x1f: TRACEI("rep nop modrm\t"); READMODRM; break;
                         default: TRACE("undefined"); UNDEFINED;

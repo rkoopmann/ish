@@ -53,6 +53,8 @@ dword_t sys_select(fd_t nfds, addr_t readfds_addr, addr_t writefds_addr, addr_t 
         timeout_ts.tv_sec = timeout_timeval.sec;
         timeout_ts.tv_nsec = timeout_timeval.usec * 1000;
     }
+    // Emacs likes to pass invalid timeout values
+    timeout_ts = timespec_normalize(timeout_ts);
 
     STRACE("select(%d, 0x%x, 0x%x, 0x%x, 0x%x {%lds %ldns}) ",
             nfds, readfds_addr, writefds_addr, exceptfds_addr,
@@ -91,6 +93,14 @@ dword_t sys_select(fd_t nfds, addr_t readfds_addr, addr_t writefds_addr, addr_t 
     struct select_context context = {readfds, writefds, exceptfds};
     int err = poll_wait(poll, select_event_callback, &context, timeout_addr == 0 ? NULL : &timeout_ts);
     STRACE("%d end select ", current->pid);
+    for (fd_t i = 0; i < nfds; i++) {
+        if (bit_test(i, readfds) || bit_test(i, writefds) || bit_test(i, exceptfds)) {
+            STRACE("%d{%s%s%s} ", i,
+                    bit_test(i, readfds) ? "r" : "",
+                    bit_test(i, writefds) ? "w" : "",
+                    bit_test(i, exceptfds) ? "x" : "");
+        }
+    }
     poll_destroy(poll);
     if (err < 0)
         return err;
